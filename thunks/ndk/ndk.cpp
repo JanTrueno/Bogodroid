@@ -163,8 +163,12 @@ NO_THUNK("AAssetManager_open",(uintptr_t)&AAssetManager_open),
 NO_THUNK("AAssetManager_fromJava", (uintptr_t)&AAssetManager_fromJava),
 NO_THUNK("AAsset_getBuffer",(uintptr_t)&AAsset_getBuffer),
 NO_THUNK("AAsset_getLength",(uintptr_t)&AAsset_getLength),
+NO_THUNK("AAsset_getLength64",(uintptr_t)&AAsset_getLength64),
 NO_THUNK("AAsset_close",(uintptr_t)&AAsset_close),
 NO_THUNK("AAsset_read", (uintptr_t)&AAsset_read),
+NO_THUNK("AAsset_seek", (uintptr_t)&AAsset_seek),
+NO_THUNK("AAsset_seek64", (uintptr_t)&AAsset_seek64),
+NO_THUNK("AAsset_openFileDescriptor64", (uintptr_t)&AAsset_openFileDescriptor64),
     {NULL, (uintptr_t)NULL}};
 
 

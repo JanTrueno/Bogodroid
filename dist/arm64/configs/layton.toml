@@ -20,12 +20,7 @@ mainIntentBundle = {}
 
 [device]
 
-# Window size (ignored when fullscreen -- the drawable size is queried from
-# SDL instead). The DS layout is portrait, so on a widescreen panel set
-# displayRotation=90: the game renders portrait into an offscreen buffer that
-# is blitted rotated onto the window. Use 270 if it ends up upside down.
-displayWidth=1280
-displayHeight=720
-displayRotation=90
-fullscreen=true
+displayWidth=960
+displayHeight=544
+displayRotation=0
 

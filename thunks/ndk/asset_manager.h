@@ -39,6 +39,7 @@ off64_t AAsset_getLength64(AAsset* asset);
 int AAsset_read(AAsset* asset, void* buf, size_t count);
 off_t AAsset_seek(AAsset* asset, off_t offset, int whence);
 off64_t AAsset_seek64(AAsset* asset, off64_t offset, int whence);
+int AAsset_openFileDescriptor64(AAsset* asset, off64_t* outStart, off64_t* outLength);
 
 // AAssetDir functions
 AAssetDir* AAssetManager_openDir(AAssetManager* mgr, const char* dirName);

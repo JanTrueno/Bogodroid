@@ -31,6 +31,7 @@ Boston, MA 02110-1301, USA.  */
 
 /* Get a definition for NULL, size_t.  */
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef HAVE_STDINT_H
 #include <stdint.h>

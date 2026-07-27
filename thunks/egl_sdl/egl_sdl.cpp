@@ -1,3 +1,5 @@
+#include "toml++/toml.hpp"
+extern toml::table config;
 #include "egl_sdl.h"
 #include "SDL2/SDL.h"
 #include "glad_egl.h"
@@ -388,7 +390,12 @@ void sdl_initialize_gles()
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fatal_error("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
     }
-    sdl_win = SDL_CreateWindow("Loader", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1, 1, SDL_WINDOW_HIDDEN | SDL_WINDOW_OPENGL);
+    int win_width = config["device"]["displayWidth"].value_or<int>(640);
+    int win_height = config["device"]["displayHeight"].value_or<int>(480);
+    Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL;
+    if (config["device"]["fullscreen"].value_or<bool>(false))
+        win_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    sdl_win = SDL_CreateWindow("Loader", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, win_width, win_height, win_flags);
     if (sdl_win == NULL) {
         fatal_error("Failed to create SDL Window: %s\n", SDL_GetError());
     }

@@ -156,7 +156,10 @@ std::shared_ptr<FakeJni::JIntArray> MainActivity::GL_LoadPNG(std::shared_ptr<Fak
     int w = 0, h = 0;
     uint8_t *px = stbi_load_from_memory((const uint8_t *)data->getArray(), data->getSize(), &w, &h, NULL, 4);
     if (!px)
+    {
+        printf("GL_LoadPNG: decode failed (%s)\n", stbi_failure_reason());
         return nullptr;
+    }
 
     // the engine uploads these as BGRA, so swap R/B (matches the Vita/Switch ports)
     for (int i = 0; i < w * h; i++) {

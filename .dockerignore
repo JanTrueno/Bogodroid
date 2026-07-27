@@ -1,0 +1,10 @@
+.git/
+.vscode/
+gamefiles/*
+!gamefiles/support_files
+!gamefiles/teapot/
+build/
+build_release/
+build_cross/
+libjnivm/build/
+il2cpp/

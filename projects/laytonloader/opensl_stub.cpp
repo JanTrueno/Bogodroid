@@ -59,7 +59,7 @@ typedef struct {
 } SLDataSource, SLDataSink;
 
 // interface ids: opaque, compared by pointer identity
-static const int iid_engine, iid_play, iid_bufferqueue, iid_volume, iid_androidcfg;
+static const int iid_engine = 0, iid_play = 0, iid_bufferqueue = 0, iid_volume = 0, iid_androidcfg = 0;
 static const void *SL_IID_ENGINE_v = &iid_engine;
 static const void *SL_IID_PLAY_v = &iid_play;
 static const void *SL_IID_BUFFERQUEUE_v = &iid_bufferqueue;

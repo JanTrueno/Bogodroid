@@ -165,6 +165,15 @@ off64_t AAsset_seek64(AAsset* asset, off64_t offset, int whence) {
     return asset->pos;
 }
 
+int AAsset_openFileDescriptor64(AAsset* asset, off64_t* outStart, off64_t* outLength) {
+    if(asset->buffer || asset->fd < 0) return -1;
+    int fd = dup(asset->fd);
+    if(fd < 0) return -1;
+    if(outStart) *outStart = 0;
+    if(outLength) *outLength = asset->length;
+    return fd;
+}
+
 AAssetDir* AAssetManager_openDir(AAssetManager* mgr, const char* dirName) {
     char* full_path = get_full_path(mgr, dirName);
     

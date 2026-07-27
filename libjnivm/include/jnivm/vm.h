@@ -3,6 +3,9 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+// <string> must precede <unordered_map>: GCC 13 rejects instantiating
+// std::hash<std::string> before <string> declares its specialization.
+#include <string>
 #include <unordered_map>
 #include <typeindex>
 #include <functional>
