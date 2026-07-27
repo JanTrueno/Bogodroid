@@ -46,10 +46,8 @@ namespace jnivm
                     void CARD_CreateDirectory(std::shared_ptr<FakeJni::JString> dir);
                     long CARD_GetAvailableBytes();
 
-                    // Level-5 ID: optional cross-game rewards/save-sync account (not DRM)
                     bool L5iD_IsEndRequest();
 
-                    // License/purchase state checks (2 == licensed, matches Vita/Switch ports)
                     int LVL_GetState();
                     int LSH_GetState();
                     int SBS_GetState();

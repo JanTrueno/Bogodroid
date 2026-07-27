@@ -129,12 +129,6 @@ bool MainActivity::L5iD_IsEndRequest()
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// License/purchase state checks. All three return 2 (matches the Switch and
-// Vita ports exactly -- the Vita port's own dispatcher treats all three
-// identically, no distinction found between them).
-// ---------------------------------------------------------------------------
-
 int MainActivity::LVL_GetState() { return 2; }
 int MainActivity::LSH_GetState() { return 2; }
 int MainActivity::SBS_GetState() { return 2; }
