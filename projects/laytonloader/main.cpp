@@ -10,6 +10,8 @@ toml::table config;
 #include <dlfcn.h>
 #include <filesystem>
 #include <iostream>
+#include <string>
+#include <sys/stat.h>
 #include <baron/baron.h>
 #include "javastubs/binding.h"
 #include "javastubs/layton.h"
@@ -58,6 +60,62 @@ typedef void (*setViewSize_t)(JNIEnv *, jobject, jint, jint);
 typedef void (*resume_t)(JNIEnv *, jobject);
 typedef void (*render_t)(JNIEnv *, jobject, jint, jint, jint, jfloat, jfloat, jfloat, jfloat);
 
+// ---------------------------------------------------------------------------
+// game patches -- the engine's own C++ file-loading functions, hooked
+// directly (not via JNI). Both the Switch and Vita homebrew ports of this
+// binary patch these two exported symbols; without them the engine cannot
+// load a single asset. Mangled names are for FS_LoadFile(char*, char const*,
+// int, int) and FS_GetLength(char const*) respectively -- verified against
+// reference/layton_nx-main/source/main.c, which hooks the identical symbols
+// on the identical (arm64) binary.
+//
+// The engine passes fname relative to the APK's assets root (e.g.
+// "data/ani/akira.png", "data-en/etext/...", confirmed by the real extracted
+// APK layout under gamefiles/layton/assets/). init_config() chdir's into
+// gamefiles/layton/, so these prepend "assets/" -- same as the Switch/Vita
+// ports' asset_path() helper.
+// ---------------------------------------------------------------------------
+
+static std::string asset_path(const char *rel)
+{
+    return std::string("assets/") + rel;
+}
+
+static uint8_t FS_LoadFile(char *buf, const char *fname, int pos, int size)
+{
+    FILE *f = fopen(asset_path(fname).c_str(), "rb");
+    if (!f)
+    {
+        printf("FS_LoadFile: missing %s\n", fname);
+        return 0;
+    }
+    fseek(f, pos, SEEK_SET);
+    fread(buf, 1, size, f);
+    fclose(f);
+    return 1;
+}
+
+static int FS_GetLength(const char *fname)
+{
+    struct stat st;
+    if (stat(asset_path(fname).c_str(), &st) >= 0)
+        return (int)st.st_size;
+    return 0;
+}
+
+static void criErr_Notify(int unk, const char *err)
+{
+    (void)unk;
+    printf("criErr: %s\n", err ? err : "(null)");
+}
+
+static void patch_game(so_module *mod)
+{
+    hook_symbol(mod, "_Z11FS_LoadFilePcPKcii", (uintptr_t)FS_LoadFile, 0);
+    hook_symbol(mod, "_Z12FS_GetLengthPKc", (uintptr_t)FS_GetLength, 0);
+    hook_symbol(mod, "criErr_Notify", (uintptr_t)criErr_Notify, 1);
+}
+
 int main(int argc, char *argv[])
 {
     print_backtrace_on_segfault(); // Registers a signal handler to print backtrace on segfaults
@@ -79,12 +137,14 @@ int main(int argc, char *argv[])
     printf("Loading libll1\n");
     so_module lmain = {};
     uintptr_t addr_lmain = 0x50000000;
-    const char *path_lmain = "libll1.so";
+    const char *path_lmain = "lib/arm64-v8a/libll1.so";
     if (!load_so_from_file(&lmain, path_lmain, addr_lmain))
     {
         printf("Failed to load libll1.so.\n");
         return 1;
     }
+
+    patch_game(&lmain);
 
     FakeJni::LocalFrame frame(vm);
     JNIEnv *env = &frame.getJniEnv();

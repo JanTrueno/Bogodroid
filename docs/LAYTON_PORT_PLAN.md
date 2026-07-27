@@ -216,6 +216,142 @@ distro, no local gcc/cmake) can't compile or run the ARM Linux target. User
 will build on a separate Linux machine (with Docker) later — build/boot
 verification (tasks #4/#5) deferred until then.
 
+## Progress log continued: reviewed the Vita port, found a critical gap
+
+**2026-07-27, later**: User pointed at
+[Rinnegatamante/layton-vita](https://github.com/Rinnegatamante/layton-vita)
+(the source of the `MethodIDs` enum they'd pasted earlier, confirming
+`LVL_/LSH_/SBS_GetState` really are all treated identically -- return `2`,
+no distinction between them, so left as-is with the DLC framing removed from
+comments per their instruction). Read through the Vita port's `main.c`,
+`player.c`, `dialog.c`, `config.h` in full and cross-checked against
+`reference/layton_nx-main/source/main.c` locally. Found one critical gap in
+`laytonloader` and one open risk:
+
+**Fixed -- missing `FS_LoadFile`/`FS_GetLength` binary patches.** Both the
+Vita and Switch ports patch two of the engine's own exported C++ functions
+directly (`hook_symbol`/`hook_addr`, not JNI):
+`_Z11FS_LoadFilePcPKcii` (`FS_LoadFile(char*, char const*, int, int)`) and
+`_Z12FS_GetLengthPKc` (`FS_GetLength(char const*)`). This is the engine's
+*entire* file-loading path for its "data/..." asset tree -- without this hook
+nothing under `gamefiles/layton/data/` would ever load, regardless of how
+correct the JNI stub layer is. `main.cpp` was missing this completely. Added
+a `patch_game()` function (mirrors `reference/layton_nx-main/source/main.c`'s
+`patch_game()`) that hooks both symbols plus `criErr_Notify` (CRI middleware's
+error callback, hooked just for debug visibility, optional). Confirmed by
+reading `loader/so_util.cpp`'s `so_load()` that this is safe to call any time
+after `so_load()`/`load_so_from_file()` returns: `so_flush_caches(mod, 1)`
+marks `[patch_base, text_end)` RWX and nothing ever revokes write access
+afterward on this Linux loader (no W^X lockdown pass like the Switch port's
+staged `so_finalize`), so there's no ordering constraint to worry about.
+
+Path handling (updated -- see next log entry): the engine passes `fname`
+relative to the APK assets root (e.g. `"data/ani/akira.png"`, confirmed by a
+comment in the Switch port's `libc_shim.c`). `FS_LoadFile`/`FS_GetLength`
+prepend `"assets/"` to match.
+
+**Previously an open risk, now resolved by restoring the real APK layout**:
+the Vita port also redirects `AAssetManager_open` onto the same asset path,
+implying the engine may use the standard NDK `AAssetManager` API for some
+files in addition to its own `FS_LoadFile`. This is no longer a concern --
+see below.
+
+**2026-07-27, later still**: user replaced the flattened `gamefiles/layton/`
+layout with the real extracted-APK structure:
+```
+gamefiles/layton/lib/arm64-v8a/libll1.so
+gamefiles/layton/assets/AVConfig.json
+gamefiles/layton/assets/data/{ani,bg,debug,font,html,script,sound,video}
+gamefiles/layton/assets/data-{en,de,es,fr,it,EU}/{ani,bg,etext,htext,itext,otext,qtext,room,script,stext,storytext}
+gamefiles/layton/assets/dexopt
+```
+This directly confirms the "data/...", "data-en/..." naming the Switch port's
+comment predicted, and means `gamefiles/layton/assets/` now exists for real --
+so `thunks/ndk/asset_manager.c`'s hardcoded `"assets"` base path resolves
+correctly with **no code changes needed there**, fixing the previously-flagged
+open risk for free. Updated `main.cpp`:
+- `path_lmain` changed from `"libll1.so"` to `"lib/arm64-v8a/libll1.so"`.
+- Added an `asset_path()` helper (`"assets/" + rel`) and pointed
+  `FS_LoadFile`/`FS_GetLength` through it, matching the Switch/Vita ports'
+  own `asset_path()` pattern exactly now that the real folder structure is in
+  place.
+
+**Not ported (deferred, not needed for Milestone 1)**:
+- Switch's landscape-mode `GL_DrawMovie` hook (fullscreen aspect-fit cutscene
+  draw) -- irrelevant until movie playback exists.
+- Switch's vsync "turnstile" mutex pairing
+  (`register_turnstile_mutexes`/`TURNSTILE_A_OFF`/`TURNSTILE_B_OFF` in
+  `reference/layton_nx-main/source/main.c`) -- works around libnx's mutexes
+  forbidding cross-thread unlock for the engine's render/logic thread
+  handoff. Whether Linux glibc pthreads need the same workaround is unknown
+  (glibc is generally more permissive about this than libnx, but it's still
+  technically undefined behavior per POSIX) -- **watch for a hang/deadlock
+  once the game starts driving multiple threads**, not before.
+- Vita's `stat_hook` (`.mp3` extension probing) and `fopen_hook`
+  (write-blocking on the obb file) -- audio-format and OBB-specific,
+  irrelevant to our loose-file layout and to Milestone 1 (no audio yet).
+
+## Progress log continued: scanned classes.dex for the full native method surface
+
+**2026-07-27, later still**: user provided the real APK's `classes.dex`/
+`classes2.dex` (from the full APK dump, not just `lib/`+`assets/`). No
+decompiler was available/used -- method names were extracted directly as raw
+ASCII strings from the dex (`grep -a -o -E "(MO_|UI_|CARD_|LVL_|LSH_|SBS_|
+L5iD_|GL_LoadPNG|DL_GetFileName|OS_GetAppVersion)[A-Za-z0-9_]*"`), and the
+actual `.so`'s exported `Java_com_Level5_LT1R_MainActivity_*` symbols were
+extracted the same way directly from `gamefiles/layton/lib/arm64-v8a/libll1.so`.
+
+**Confirmed exported entry points in the .so** (only 5 total):
+`render`, `resume`, `setViewSize`, `suspend`, `MO_1CreateTexture`. `suspend`
+was not previously known/wired up -- likely the counterpart to `resume`
+(pause/exit lifecycle). `MO_CreateTexture` already known, deferred to movie
+work. Other dex-declared native methods (`MO_ReleaseTexture`, `MO_Resume`,
+`MO_Suspend`) have **no matching exported symbol** in this build, meaning if
+used at all it's via runtime `RegisterNatives()`, not the static naming
+convention -- not something host code calls directly either way.
+
+**Confirmed via `libjnivm/src/jnivm/internal/method.cpp`**: unregistered JNI
+methods do not crash. `GetMethodID` fabricates a placeholder `Method` on a
+lookup miss, and `Call*Method` on it returns `defaultVal<T>()` (`{}` --
+0/false/null) rather than crashing or throwing. This is the same effective
+behavior as the Switch port's manual `if (!strncmp(name, "L5iD_", 5)) return
+0;` wildcard, just built into the framework for every unregistered
+name/signature automatically.
+
+**Full extra native-method surface found in classes.dex, not yet stubbed**
+(confirmed safe to leave unregistered per the above -- listed here for
+later, deliberately not implemented now per user instruction, "add to plan
+for later, not now"):
+- `UI_EndEditText`, `UI_ExitApp`, `UI_OpenBrowser`, `UI_ShowToast`,
+  `UI_WebView` -- misc UI callbacks (`UI_ExitApp` is the one most worth doing
+  first when this work is picked up: currently a no-op default means an
+  in-game "exit" button does nothing instead of closing the app).
+- `LSH_Start`/`LSH_End`, `LVL_Start`/`LVL_End`, `SBS_Start`/`SBS_End` -- pair
+  with the already-stubbed `*_GetState` calls; likely kick off the
+  license-check state machine that `GetState` polls. Since `GetState` already
+  unconditionally returns success, these being no-ops should be harmless.
+- Extended `L5iD_*` surface (17 methods total vs. the 1 currently stubbed):
+  `L5iD_Init`, `L5iD_Login`, `L5iD_IsLinkedAccount`, `L5iD_CreateGdkey`,
+  `L5iD_GetGdkey(sCount)`, `L5iD_GetUdkey(Count)`, `L5iD_SetUdkey`,
+  `L5iD_DownloadCloudSave`, `L5iD_UploadCloudSave`, `L5iD_GetCloudSaveData`,
+  `L5iD_StartAutoLinkDevice`, `L5iD_NeedSignature`, `L5iD_GetRequestVersion`,
+  `L5iD_GetL5iDStatusCode`, `L5iD_GetLastStatusCode`,
+  `L5iD_SetWebViewCloseButtonText`, `L5iD_HTTP`, `L5iD_L5iDStatus`.
+
+**Not methods -- named constants found in the same scan, no implementation
+needed**: `LVL_IDLE/WAIT/SUCCESS/ERROR/RETRY`, `SBS_IDLE/WAIT/ERROR/RETRY/
+LICENSED/NOT_LICENSED/ITEM_DEBUG_PURCHASE_MODE`, `UI_MODE/UI_TYPE_DEFAULT/
+UI_TYPE_POPUPWINDOW`, `CARD_UTF_8`. Useful confirmation that `SBS_GetState`
+really is a binary licensed/not-licensed check (matches the earlier decision
+to leave it returning the known-working value).
+
+**Recommended next step once actually building**: build with the default
+`Debug` `CMAKE_BUILD_TYPE` (already turns on `JNIVM_ENABLE_TRACE`,
+`JNI_DEBUG`, `VERBOSE_LOG` per `CMakeLists.txt`) and read the
+`"Constructed Unresolved symbol..."` log lines to see which of the methods
+above the engine *actually* calls at runtime, instead of stubbing all ~25
+speculatively. Implement only what real usage shows is needed.
+
 ## Open items / blockers (current)
 
 1. **Build/test environment not yet set up.** This dev machine is Windows with

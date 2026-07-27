@@ -118,7 +118,10 @@ long MainActivity::CARD_GetAvailableBytes()
 }
 
 // ---------------------------------------------------------------------------
-// Level-5 ID sign-in flow -- report everything done/declined so nothing blocks
+// Level-5 ID: an OPTIONAL cross-game rewards/save-sync account, not DRM and
+// not required to play (see level5-id.com/guide/layton-fushigi-app/
+// registration.html). Reporting "declined" just matches a real device where
+// the player skipped linking.
 // ---------------------------------------------------------------------------
 
 bool MainActivity::L5iD_IsEndRequest()
@@ -127,7 +130,9 @@ bool MainActivity::L5iD_IsEndRequest()
 }
 
 // ---------------------------------------------------------------------------
-// Licensing / DLC purchase state (2 == licensed, matches Vita/Switch ports)
+// License/purchase state checks. All three return 2 (matches the Switch and
+// Vita ports exactly -- the Vita port's own dispatcher treats all three
+// identically, no distinction found between them).
 // ---------------------------------------------------------------------------
 
 int MainActivity::LVL_GetState() { return 2; }
