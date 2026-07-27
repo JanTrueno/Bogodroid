@@ -4,6 +4,26 @@
 #include "baron/baron.h"
 #include "android.h"
 
+#include <string>
+
+// Software keyboard state, driven by the loader's event loop.
+//
+// On Android UI_StartEditText pops the IME and returns straight away; the
+// game then polls UI_GetEditState every frame until it clears and reads the
+// result with UI_GetEditText. (The Switch port blocks on a system applet
+// instead -- reference/layton_nx-main/source/jni.c:182.) There is no system
+// IME here, so the loader feeds keystrokes in while editing is active.
+namespace layton_ime
+{
+    bool editing();
+    void append(const char *utf8);
+    void backspace();
+    void commit(); // accept: clears editing, keeps the text
+    void cancel(); // dismiss: clears editing and the text
+    const std::string &text();
+    int type(); // 0 = free text, non-zero = numeric (engine's editType)
+}
+
 // libll1.so (Professor Layton and the Curious Village HD, Level-5's custom
 // engine) does not use the standard Android API surface. It resolves a
 // fixed set of ~20 custom native methods by name on its own MainActivity

@@ -392,12 +392,52 @@ void sdl_initialize_gles()
     }
     int win_width = config["device"]["displayWidth"].value_or<int>(640);
     int win_height = config["device"]["displayHeight"].value_or<int>(480);
+    const bool want_fullscreen = config["device"]["fullscreen"].value_or<bool>(false);
+
+    const char *driver = SDL_GetCurrentVideoDriver();
+    printf("SDL video driver: %s\n", driver ? driver : "(none)");
+
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL;
-    if (config["device"]["fullscreen"].value_or<bool>(false))
+    if (want_fullscreen) {
+        // Size the window to the display up front. On kmsdrm the window is the
+        // whole display anyway; under X11/XWayland a window already at the
+        // display size still covers the screen even if the compositor refuses
+        // the fullscreen request.
+        SDL_DisplayMode dm;
+        if (SDL_GetDesktopDisplayMode(0, &dm) == 0) {
+            win_width = dm.w;
+            win_height = dm.h;
+        } else {
+            printf("SDL_GetDesktopDisplayMode failed (%s) -- using the configured size\n", SDL_GetError());
+        }
         win_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    }
+
     sdl_win = SDL_CreateWindow("Loader", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, win_width, win_height, win_flags);
     if (sdl_win == NULL) {
         fatal_error("Failed to create SDL Window: %s\n", SDL_GetError());
+    }
+
+    if (want_fullscreen) {
+        // Re-assert after creation: this is what actually takes effect on
+        // window managers that ignored the creation flag (common on XWayland
+        // without a compositor managing the surface). Harmless on kmsdrm,
+        // where it is already fullscreen.
+        if (SDL_SetWindowFullscreen(sdl_win, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0)
+            printf("SDL_SetWindowFullscreen failed: %s\n", SDL_GetError());
+
+        int got_w = 0, got_h = 0;
+        SDL_GetWindowSize(sdl_win, &got_w, &got_h);
+        if (got_w < win_width || got_h < win_height) {
+            // Still not covering the display -- drop the decorations and pin it
+            // to the top-left at the display size.
+            printf("window is %dx%d, wanted %dx%d -- falling back to borderless\n",
+                   got_w, got_h, win_width, win_height);
+            SDL_SetWindowFullscreen(sdl_win, 0);
+            SDL_SetWindowBordered(sdl_win, SDL_FALSE);
+            SDL_SetWindowSize(sdl_win, win_width, win_height);
+            SDL_SetWindowPosition(sdl_win, 0, 0);
+        }
     }
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);

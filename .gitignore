@@ -8,3 +8,6 @@ build_cross/
 libjnivm/build/
 il2cpp/
 projects/unityloader/monocompat/il2cpp_log_shim.cpp
+dist/apk_lt1reu/split_InstallAssets.apk
+dist/apk_lt1reu/split_config.arm64_v8a.apk
+dist/apk_lt1reu/base.apk

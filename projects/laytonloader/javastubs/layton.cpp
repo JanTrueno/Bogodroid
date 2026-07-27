@@ -1,5 +1,6 @@
 #include "baron/baron.h"
 #include "layton.h"
+#include <cstring>
 #include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -70,19 +71,76 @@ std::shared_ptr<FakeJni::JFloatArray> MainActivity::MO_UpdateTexture()
 // Software keyboard -- not implemented yet
 // ---------------------------------------------------------------------------
 
+namespace layton_ime
+{
+    static std::string s_text;
+    static bool s_editing = false;
+    static int s_type = 0;
+
+    static const size_t TEXT_MAX = 511; // matches the Switch port's ime_text
+
+    bool editing() { return s_editing; }
+    const std::string &text() { return s_text; }
+    int type() { return s_type; }
+
+    void append(const char *utf8)
+    {
+        if (!s_editing || !utf8)
+            return;
+        // editType != 0 is the engine's numeric keypad (puzzle answers)
+        if (s_type != 0)
+        {
+            for (const char *c = utf8; *c; c++)
+                if (*c < '0' || *c > '9')
+                    return;
+        }
+        if (s_text.size() + strlen(utf8) <= TEXT_MAX)
+            s_text += utf8;
+    }
+
+    void backspace()
+    {
+        if (!s_editing || s_text.empty())
+            return;
+        // step back over a whole UTF-8 sequence, not one byte
+        size_t i = s_text.size() - 1;
+        while (i > 0 && (s_text[i] & 0xC0) == 0x80)
+            i--;
+        s_text.erase(i);
+    }
+
+    void commit() { s_editing = false; }
+
+    void cancel()
+    {
+        s_editing = false;
+        s_text.clear();
+    }
+
+    static void begin(const char *initial, int editType)
+    {
+        s_text = initial ? initial : "";
+        s_type = editType;
+        s_editing = true;
+    }
+}
+
 bool MainActivity::UI_GetEditState()
 {
-    return false;
+    return layton_ime::editing();
 }
 
 std::shared_ptr<FakeJni::JString> MainActivity::UI_GetEditText()
 {
-    return std::make_shared<FakeJni::JString>("");
+    return std::make_shared<FakeJni::JString>(layton_ime::text().c_str());
 }
 
 void MainActivity::UI_StartEditText(std::shared_ptr<FakeJni::JString> initial, int editType)
 {
-    printf("UI_StartEditText(%s, %d) -- software keyboard not implemented yet\n", initial ? initial->c_str() : "", editType);
+    layton_ime::begin(initial ? initial->c_str() : "", editType);
+    printf("UI_StartEditText(\"%s\", %d) -- type to edit, Enter accepts, Esc cancels\n",
+           initial ? initial->c_str() : "", editType);
+    fflush(stdout);
 }
 
 void MainActivity::UI_SetIdleTimerDisabled(bool disabled)

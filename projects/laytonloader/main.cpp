@@ -238,6 +238,121 @@ static void rot_blit(int rotation, int win_w, int win_h)
     glDisableVertexAttribArray(rot.loc_uv);
 }
 
+// ---------------------------------------------------------------------------
+// input -- the engine takes up to two touch points, in game-view coordinates.
+// Points are held normalised (0..1 across the window) and mapped into view
+// space per frame, inverting the display rotation so a touch lands where it
+// looks like it landed. Mirrors panel_to_view() in
+// reference/layton_nx-main/source/main.c:429.
+// ---------------------------------------------------------------------------
+
+struct TouchPoint
+{
+    SDL_FingerID id;
+    float x, y; // normalised 0..1 in window space
+    bool active;
+};
+
+static TouchPoint touch_points[2];
+static bool mouse_down;
+static float mouse_x, mouse_y; // normalised 0..1
+
+static void touch_down(SDL_FingerID id, float nx, float ny)
+{
+    for (auto &t : touch_points)
+    {
+        if (t.active && t.id == id)
+        {
+            t.x = nx;
+            t.y = ny;
+            return;
+        }
+    }
+    for (auto &t : touch_points)
+    {
+        if (!t.active)
+        {
+            t.id = id;
+            t.x = nx;
+            t.y = ny;
+            t.active = true;
+            return;
+        }
+    }
+    // more than two fingers: the engine only accepts two, ignore the rest
+}
+
+static void touch_move(SDL_FingerID id, float nx, float ny)
+{
+    for (auto &t : touch_points)
+    {
+        if (t.active && t.id == id)
+        {
+            t.x = nx;
+            t.y = ny;
+            return;
+        }
+    }
+}
+
+static void touch_up(SDL_FingerID id)
+{
+    for (auto &t : touch_points)
+    {
+        if (t.active && t.id == id)
+            t.active = false;
+    }
+}
+
+// normalised window point -> game-view coordinates (inverse of rot_blit)
+static void panel_to_view(float nx, float ny, int rotation, int view_w, int view_h,
+                          float *vx, float *vy)
+{
+    switch (rotation)
+    {
+    case 90:
+        *vx = (1.0f - ny) * view_w;
+        *vy = nx * view_h;
+        break;
+    case 180:
+        *vx = (1.0f - nx) * view_w;
+        *vy = (1.0f - ny) * view_h;
+        break;
+    case 270:
+        *vx = ny * view_w;
+        *vy = (1.0f - nx) * view_h;
+        break;
+    default:
+        *vx = nx * view_w;
+        *vy = ny * view_h;
+        break;
+    }
+}
+
+static void collect_input(int rotation, int view_w, int view_h,
+                          int *touch_num, float *x1, float *y1, float *x2, float *y2)
+{
+    *touch_num = 0;
+    *x1 = *y1 = *x2 = *y2 = 0.0f;
+
+    float *out[2][2] = {{x1, y1}, {x2, y2}};
+    for (const auto &t : touch_points)
+    {
+        if (!t.active || *touch_num >= 2)
+            continue;
+        panel_to_view(t.x, t.y, rotation, view_w, view_h,
+                      out[*touch_num][0], out[*touch_num][1]);
+        (*touch_num)++;
+    }
+
+    // mouse stands in for a finger when there is no touch panel
+    if (*touch_num == 0 && mouse_down)
+    {
+        panel_to_view(mouse_x, mouse_y, rotation, view_w, view_h, x1, y1);
+        *touch_num = 1;
+    }
+}
+
 Baron::Jvm vm;
 
 int main(int argc, char *argv[])
@@ -337,21 +452,98 @@ int main(int argc, char *argv[])
 
     printf("Entering render loop\n");
     bool running = true;
+    bool imeActive = false;
     while (running)
     {
+        // Follow the engine's edit state: SDL only delivers SDL_TEXTINPUT
+        // while text input is started, so mirror it here.
+        if (layton_ime::editing() != imeActive)
+        {
+            imeActive = layton_ime::editing();
+            if (imeActive)
+                SDL_StartTextInput();
+            else
+            {
+                SDL_StopTextInput();
+                printf("edit finished: \"%s\"\n", layton_ime::text().c_str());
+                fflush(stdout);
+            }
+        }
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev))
         {
             if (ev.type == SDL_QUIT)
                 running = false;
+            else if (imeActive && ev.type == SDL_TEXTINPUT)
+                layton_ime::append(ev.text.text);
+            else if (imeActive && ev.type == SDL_KEYDOWN)
+            {
+                switch (ev.key.keysym.sym)
+                {
+                case SDLK_BACKSPACE:
+                    layton_ime::backspace();
+                    break;
+                case SDLK_RETURN:
+                case SDLK_RETURN2:
+                case SDLK_KP_ENTER:
+                    layton_ime::commit();
+                    break;
+                case SDLK_ESCAPE:
+                    layton_ime::cancel();
+                    break;
+                default:
+                    break;
+                }
+            }
+            // A compositor may apply fullscreen after we first measured the
+            // window (common under XWayland), so keep the blit target in sync.
+            // Only the destination rect changes -- the game's view and the FBO
+            // stay put, so the engine is never resized mid-run.
+            else if (ev.type == SDL_WINDOWEVENT &&
+                     (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                      ev.window.event == SDL_WINDOWEVENT_RESIZED))
+            {
+                SDL_GL_GetDrawableSize(sdl_win, &winWidth, &winHeight);
+            }
+            // SDL reports finger positions already normalised to the window
+            else if (ev.type == SDL_FINGERDOWN)
+                touch_down(ev.tfinger.fingerId, ev.tfinger.x, ev.tfinger.y);
+            else if (ev.type == SDL_FINGERMOTION)
+                touch_move(ev.tfinger.fingerId, ev.tfinger.x, ev.tfinger.y);
+            else if (ev.type == SDL_FINGERUP)
+                touch_up(ev.tfinger.fingerId);
+            // Mouse coordinates are in window (not drawable) units, so
+            // normalise them the same way rather than mixing the two.
+            else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT)
+            {
+                int ww = 1, wh = 1;
+                SDL_GetWindowSize(sdl_win, &ww, &wh);
+                mouse_x = (float)ev.button.x / (float)ww;
+                mouse_y = (float)ev.button.y / (float)wh;
+                mouse_down = true;
+            }
+            else if (ev.type == SDL_MOUSEMOTION && mouse_down)
+            {
+                int ww = 1, wh = 1;
+                SDL_GetWindowSize(sdl_win, &ww, &wh);
+                mouse_x = (float)ev.motion.x / (float)ww;
+                mouse_y = (float)ev.motion.y / (float)wh;
+            }
+            else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT)
+                mouse_down = false;
         }
+
+        int touchNum = 0;
+        float tx1 = 0.0f, ty1 = 0.0f, tx2 = 0.0f, ty2 = 0.0f;
+        collect_input(rotation, viewWidth, viewHeight, &touchNum, &tx1, &ty1, &tx2, &ty2);
 
         if (rotation != 0)
             glBindFramebuffer(GL_FRAMEBUFFER, rot.fbo);
         glViewport(0, 0, viewWidth, viewHeight);
 
-        // frame_step=1, unused=0, touch_num=0, no touch points yet
-        gameRender(env, activityObj, 1, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f);
+        // frame_step=1, button=0 (unused), then the touch state
+        gameRender(env, activityObj, 1, 0, touchNum, tx1, ty1, tx2, ty2);
 
         if (rotation != 0)
             rot_blit(rotation, winWidth, winHeight);
