@@ -352,6 +352,89 @@ to leave it returning the known-working value).
 above the engine *actually* calls at runtime, instead of stubbing all ~25
 speculatively. Implement only what real usage shows is needed.
 
+## Progress log continued: diffed the Switch port's import table against neo's symtables
+
+**2026-07-27, later still**: cross-referenced `reference/layton_nx-main/source/
+imports.c` (the Switch port's complete, confirmed-working import table for
+this exact binary -- 203 symbols) against everything `neo`'s
+`symtable_libc`/`symtable_ndk`/`symtable_gles2`/`symtable_egl_sdl` actually
+cover (`thunks/libc/symtab` -- 1728 generated entries -- plus
+`thunks/libc/libc_table.cpp`'s manual additions, `thunks/ndk/ndk.cpp`,
+`thunks/egl_sdl/egl_sdl.cpp`, and `thunks/khronos/gles2_funcs.hpp`'s ~900
+GL functions). Found real, specific gaps instead of a vague "might be
+missing libc++ symbols" guess:
+
+- **`slCreateEngine`, `SL_IID_ENGINE`, `SL_IID_BUFFERQUEUE`, `SL_IID_PLAY`,
+  `SL_IID_VOLUME`, `SL_IID_ANDROIDCONFIGURATION`** -- OpenSL ES, completely
+  absent from `neo` (confirmed earlier: only `thunks/openal/` exists).
+  **This is likely a bigger and EARLIER blocker than previously assessed.**
+  The Switch port's `main.c` calls `game_resume()` right after `JNI_OnLoad`/
+  `setViewSize`, with the comment "resume() starts CRI audio" -- meaning
+  OpenSL ES symbol resolution is probably needed within the first few calls
+  into the engine, likely *before* the first `render()` call, not safely
+  deferred until "movie/audio work" the way Milestone 1 planning assumed.
+  If these imports fail to resolve, either `so_resolve` logs a missing-symbol
+  warning and leaves a null function pointer (which then crashes the moment
+  the engine calls it, probably inside `resume()`), or -- depending on how
+  critical the engine considers audio init -- it could crash immediately.
+  **This may need to move up from "deferred" to "needed for Milestone 1."**
+- **`AAsset_getLength64`, `AAsset_openFileDescriptor64`, `AAsset_seek`** --
+  missing from `thunks/ndk/asset_manager.c`, which only implements
+  `AAsset_getLength` (32-bit), `AAsset_seek64`, and no file-descriptor
+  variant at all. Only matters if the engine actually calls these three
+  specific entry points via `AAssetManager` (still unconfirmed either way --
+  see the earlier `AAssetManager` note, now resolved for the *base path*
+  question but not for *symbol coverage*).
+- **Math functions** (`sin`, `cos`, `tan`, `pow`, `log`, `exp`, `fmod`,
+  `atan2`, `asin`, `acos`, `modf`, `sincosf`, and their `f`-suffixed
+  variants) -- **not actually a code gap.** Checked
+  `thunks/libc/symtab_exclude` and every one of these is *deliberately*
+  excluded from `symtable_libc`. Per `loader/so_util.cpp`'s header comment
+  ("Can now load multiple android system libraries for better compatibility,
+  e.g. libm, libc++, etc.") and `so_resolve_link`'s cross-module resolution
+  (matching a loaded module's `DT_NEEDED`/SONAME), the intended fix is
+  loading the real bionic `libm.so` (pulled from an Android NDK sysroot) as
+  a second `so_module` alongside `libll1.so` -- the same pattern
+  `unityloader` already uses for `libmonobdwgc-2.0.so` etc. -- not writing
+  thunk implementations by hand. Low-effort once actually building (grab
+  `libm.so` from any NDK's `sysroot/usr/lib/aarch64-linux-android/<api>/`,
+  load it at a second fixed address before `libll1.so`).
+
+**Net effect on plan**: audio (OpenSL ES) may need to be pulled forward from
+"deferred, Milestone 2+" to "required for `laytonloader` to get past
+`resume()` at all" -- worth revisiting once real build/run logs confirm
+whether `resume()` actually dereferences these before the first render call.
+
+## Progress log continued: added a Tier-1 OpenSL ES stub (no real audio yet)
+
+**2026-07-27, later still**: per user decision ("stub it, no audio for
+now"), added `projects/laytonloader/opensl_stub.h`/`.cpp`, a new
+`symtable_opensl[]` covering exactly the 6 missing symbols found by the
+import diff above (`slCreateEngine`, `SL_IID_ENGINE`, `SL_IID_PLAY`,
+`SL_IID_BUFFERQUEUE`, `SL_IID_VOLUME`, `SL_IID_ANDROIDCONFIGURATION`), wired
+into `main.cpp`'s `so_dynamic_libraries[]`. No CMake changes needed
+(`PROJ_SOURCES` globs recursively).
+
+Implementation mirrors `reference/layton_nx-main/source/opensl.c`'s object/
+interface/vtable model exactly (same method slot ordering -- required, since
+the game dispatches by vtable offset not name), since that's a proven-correct
+implementation of this exact API slice against this exact binary. The only
+real change: the Switch port's worker thread feeds real PCM into `audout`;
+this stub's worker thread just paces a short delay (based on buffer size and
+assumed 48kHz stereo s16) then fires the buffer-queue-consumed callback,
+discarding the actual audio data. This keeps CRI ADX2's internal buffer-queue
+pump moving (so it doesn't stall waiting for buffer space) without any real
+audio output existing yet. Uses `std::thread`/`std::mutex`/
+`std::condition_variable` instead of the reference's libnx-specific
+`Thread`/`Mutex`/`CondVar` types, otherwise structurally identical.
+
+**Not yet verified by a build**: whether the DynLibFunction data-symbol
+resolution pattern used here (`{"SL_IID_ENGINE", (uintptr_t)&SL_IID_ENGINE_v}`,
+where the local static variable's *address* becomes the resolved symbol,
+double-indirection preserved) works exactly like the existing precedent in
+`thunks/libc/libc_table.cpp`'s `{"__sF", (uintptr_t)&__sF_fake}` -- structurally
+identical pattern, reused rather than invented, but still compiler-unverified.
+
 ## Open items / blockers (current)
 
 1. **Build/test environment not yet set up.** This dev machine is Windows with

@@ -33,6 +33,7 @@ toml::table config;
 #include "glad_egl.h"
 #include "egl_sdl.h"
 #include "debug_utils.h"
+#include "opensl_stub.h"
 
 using namespace FakeJni;
 
@@ -50,6 +51,7 @@ DynLibFunction *so_dynamic_libraries[32] = {
     symtable_ndk,
     symtable_gles2,
     symtable_egl_sdl,
+    symtable_opensl,
     NULL
 };
 
