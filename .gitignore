@@ -15,5 +15,7 @@ dist/apk_lt1reu/base.apk
 
 # vendored build output (rebuild with projects/*/tools/*.sh)
 projects/*/third_party/
-# scratch: pulled apks, extracted game data, lib bundles
+# scratch: pulled apks, extracted game data, lib bundles, packaged ports
 dist/
+# third-party port kept locally for reference only, not part of this project
+reference/
