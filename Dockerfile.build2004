@@ -1,0 +1,40 @@
+# Build environment targeting Ubuntu 20.04's glibc (2.31) for aarch64.
+#
+# The container is native amd64 -- only the compiler targets arm64 -- so
+# nothing runs under QEMU and the build is fast. Building on a newer host
+# instead produces binaries needing GLIBC_2.38, which will not load on an
+# older device.
+#
+#   docker build -f Dockerfile.build2004 -t bogodroid-build2004 .
+#   docker run --rm -v "$PWD:/src" -w /src bogodroid-build2004 ./tools/build_2004.sh
+
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# amd64 packages come from the main archive, arm64 from ports -- Ubuntu does
+# not carry arm64 on the regular mirrors, so both have to be pinned by
+# architecture or apt looks for every package in both places and fails.
+RUN dpkg --add-architecture arm64 \
+ && sed -i 's|^deb |deb [arch=amd64] |' /etc/apt/sources.list \
+ && printf '%s\n' \
+      'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal main restricted universe multiverse' \
+      'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-updates main restricted universe multiverse' \
+      'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports focal-security main restricted universe multiverse' \
+      > /etc/apt/sources.list.d/arm64-ports.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake pkg-config make file \
+      ca-certificates curl xz-utils \
+      yasm nasm \
+      gcc-10-aarch64-linux-gnu g++-10-aarch64-linux-gnu \
+      libsdl2-dev:arm64 \
+      libzip-dev:arm64 \
+      libbsd-dev:arm64 \
+ && rm -rf /var/lib/apt/lists/*
+
+# focal's default cross gcc is 9, which is thin on C++20; 10 is the newest here
+# and still targets the 2.31 glibc we want. The toolchain file and FFmpeg's
+# --cross-prefix both expect unversioned names, hence the symlinks.
+RUN ln -sf /usr/bin/aarch64-linux-gnu-gcc-10 /usr/bin/aarch64-linux-gnu-gcc \
+ && ln -sf /usr/bin/aarch64-linux-gnu-g++-10 /usr/bin/aarch64-linux-gnu-g++ \
+ && ln -sf /usr/bin/aarch64-linux-gnu-cpp-10 /usr/bin/aarch64-linux-gnu-cpp

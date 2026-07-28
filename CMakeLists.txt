@@ -79,6 +79,9 @@ add_subdirectory(libjnivm ${CMAKE_CURRENT_BINARY_DIR}/libjnivm_build)
 
 set(PROJ_SOURCE_DIR ${CMAKE_SOURCE_DIR}/projects/${CMAKE_PROJECT_NAME})
 file(GLOB_RECURSE PROJ_SOURCES ${PROJ_SOURCE_DIR}/*.c ${PROJ_SOURCE_DIR}/*.cc ${PROJ_SOURCE_DIR}/*.cpp)
+# Vendored dependencies live under third_party/ and are linked, not compiled
+# into the loader -- without this the glob also picks up their sample code.
+list(FILTER PROJ_SOURCES EXCLUDE REGEX "/third_party/")
 
 add_executable(${CMAKE_PROJECT_NAME} 
     ${PROJ_SOURCES}
@@ -152,6 +155,13 @@ if(IL2CPP_TRACE AND PROJ STREQUAL "unityloader")
     target_compile_definitions(my_target PRIVATE IL2CPP_TRACE=1)
 endif()
 
+# Per-project dependencies live with the project, so a port that needs
+# something unusual (Laytonloader pulls in FFmpeg for its cutscenes) does not
+# push that onto every other loader.
+if(EXISTS ${PROJ_SOURCE_DIR}/project.cmake)
+    include(${PROJ_SOURCE_DIR}/project.cmake)
+endif()
+
 # Add extra debug definitions ONLY for Debug builds
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     message(STATUS "Debug build detected: Enabling JNI_DEBUG and VERBOSE_LOG")
@@ -188,8 +198,11 @@ set_source_files_properties(
 )
 
 # Precompiled headers for faster compilation of template-heavy code
+# The closing '>' of an angle-bracket include has to be escaped as $<ANGLE-R>,
+# or the generator expression swallows it and the generated pch becomes
+# #include ">" (CMake 3.28 fails the build outright).
 target_precompile_headers(${CMAKE_PROJECT_NAME} PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:<baron/baron.h>>
-    $<$<COMPILE_LANGUAGE:CXX>:<javac.h>>
-    $<$<COMPILE_LANGUAGE:CXX>:<android.h>>
+    $<$<COMPILE_LANGUAGE:CXX>:<baron/baron.h$<ANGLE-R>>
+    $<$<COMPILE_LANGUAGE:CXX>:<javac.h$<ANGLE-R>>
+    $<$<COMPILE_LANGUAGE:CXX>:<android.h$<ANGLE-R>>
 )

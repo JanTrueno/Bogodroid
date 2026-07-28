@@ -1,5 +1,6 @@
 #include "baron/baron.h"
 #include "layton.h"
+#include "../movie.h"
 #include <cstring>
 #include <filesystem>
 
@@ -16,38 +17,42 @@ using namespace jnivm::com::Level5::LT1R;
 
 bool MainActivity::MO_PlayMovie(std::shared_ptr<FakeJni::JString> file)
 {
-    printf("MO_PlayMovie(%s) -- movie playback not implemented yet\n", file ? file->c_str() : "");
-    return false;
+    if (!file)
+        return false;
+    return movie_open(file->c_str(), 0, 0);
 }
 
+// Some cutscenes live as a region inside a larger file
 bool MainActivity::MO_PlayMovieRegion(std::shared_ptr<FakeJni::JString> file, int offset, int size)
 {
-    printf("MO_PlayMovie(%s, %d, %d) -- movie playback not implemented yet\n", file ? file->c_str() : "", offset, size);
-    return false;
+    if (!file)
+        return false;
+    return movie_open(file->c_str(), offset, size);
 }
 
 bool MainActivity::MO_GetState()
 {
-    return false;
+    return movie_active();
 }
 
 int MainActivity::MO_GetPosition()
 {
-    return 0;
+    return movie_position_ms();
 }
 
 void MainActivity::MO_PauseMovie(bool pause)
 {
-    (void)pause;
+    movie_pause(pause);
 }
 
 void MainActivity::MO_ReleaseMovie()
 {
+    movie_close();
 }
 
 void MainActivity::MO_SetVolume(float volume)
 {
-    (void)volume;
+    movie_set_volume(volume);
 }
 
 std::shared_ptr<FakeJni::JFloatArray> MainActivity::MO_UpdateTexture()
