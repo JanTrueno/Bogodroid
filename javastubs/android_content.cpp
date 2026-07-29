@@ -151,7 +151,13 @@ jnivm::android::content::Context::getAssets()
 std::shared_ptr<jnivm::android::content::pm::ApplicationInfo>
 jnivm::android::content::Context::getApplicationInfo()
 {
-    return std::make_shared<jnivm::android::content::pm::ApplicationInfo>();
+    auto info = std::make_shared<jnivm::android::content::pm::ApplicationInfo>();
+    // Absolute, because a guest that dlopen()s out of this directory has no
+    // reason to share our working directory.
+    auto dir = config["paths"]["android_native_lib_dir"].value_or<std::string>("");
+    if (!dir.empty())
+        info->nativeLibraryDir = (FakeJni::JString)std::filesystem::absolute(dir).string();
+    return info;
 }
 
 std::shared_ptr<FakeJni::JObject>
@@ -335,6 +341,7 @@ BEGIN_NATIVE_DESCRIPTOR(jnivm::android::content::pm::ActivityInfo) { FakeJni::Co
 
     BEGIN_NATIVE_DESCRIPTOR(jnivm::android::content::pm::ApplicationInfo) { FakeJni::Constructor<ApplicationInfo> {} },
     { FakeJni::Field<&ApplicationInfo::splitPublicSourceDirs> {}, "splitPublicSourceDirs", FakeJni::JMethodID::PUBLIC },
+    { FakeJni::Field<&ApplicationInfo::nativeLibraryDir> {}, "nativeLibraryDir", FakeJni::JFieldID::PUBLIC },
     END_NATIVE_DESCRIPTOR
 
     BEGIN_NATIVE_DESCRIPTOR(jnivm::android::content::pm::PackageManager) { FakeJni::Constructor<PackageManager> {} },

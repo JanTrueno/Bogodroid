@@ -114,6 +114,31 @@ extern "C" ABI_ATTR void* dlopen_impl(const char* filename, int flags)
     if (filename == NULL)
         return NULL;
 
+    // Libraries we deliberately do not provide MUST fail here.
+    //
+    // The catch-all below returns 0xDEAD ("loaded") for anything unrecognised,
+    // which is fine for a library whose symbols we shim -- but for one we have
+    // no implementation of, the caller takes it as success and then dlsym()s a
+    // batch of entry points that all come back NULL. A guest that trusts its own
+    // dlopen check calls straight through a null pointer.
+    //
+    // libaaudio.so is the live example: it is Android-only (there is no AAudio
+    // on a Linux handheld), and audio middleware picks it over OpenSL ES
+    // whenever Build.VERSION.SDK_INT >= 26 -- which our Build stub reports.
+    // Failing the dlopen is what makes such an engine fall back to OpenSL ES,
+    // which the ports do implement.
+    static const char *const unavailable[] = {
+        "libaaudio.so",
+    };
+    for (size_t i = 0; i < sizeof(unavailable) / sizeof(*unavailable); i++)
+    {
+        if (strstr(filename, unavailable[i]))
+        {
+            printf("dlopen(%s) -> NULL (not provided; guest should use its fallback)\n", filename);
+            return NULL;
+        }
+    }
+
     char resolved1[PATH_MAX];
     char resolved2[PATH_MAX];
     realpath(filename, resolved1);

@@ -452,9 +452,21 @@ namespace android {
             inline static int GET_DEVICES_OUTPUTS = 2;
             inline static int STREAM_MUSIC = 3;
             bool isBluetoothA2dpOn();
+            bool isBluetoothScoOn();
+            bool isMusicActive();
             std::shared_ptr<FakeJni::JString> getProperty(std::shared_ptr<FakeJni::JString> property);
             std::shared_ptr<jnivm::Array<jnivm::android::media::AudioDeviceInfo>> getDevices(int type);
             int getStreamVolume(int stream);
+        };
+
+        // Audio engines query this for the device's native output rate before
+        // choosing a mixer rate (Wwise does exactly this on its Android sink).
+        // Only the static getNativeOutputSampleRate is ever called -- nothing
+        // here plays audio through AudioTrack, that goes via OpenSL ES.
+        class AudioTrack : public FakeJni::JObject {
+        public:
+            DEFINE_CLASS_NAME("android/media/AudioTrack")
+            static int getNativeOutputSampleRate(int streamType);
         };
 
         class MediaRouterRouteInfo : public FakeJni::JObject {
@@ -673,6 +685,12 @@ namespace android {
                 DEFINE_CLASS_NAME("android/content/pm/ApplicationInfo")
 
                 std::shared_ptr<jnivm::Array<FakeJni::JString>> splitPublicSourceDirs = std::make_shared<jnivm::Array<FakeJni::JString>>();
+
+                // Directory the app's .so files live in. Engines read this to
+                // dlopen optional native libraries next to their own binary
+                // (Limbo does). Filled in by Context::getApplicationInfo() from
+                // paths.android_native_lib_dir.
+                FakeJni::JString nativeLibraryDir = (FakeJni::JString) "";
             };
 
             class PackageManager : public FakeJni::JObject {

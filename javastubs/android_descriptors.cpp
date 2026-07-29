@@ -47,6 +47,7 @@ void InitJNIAndroidClasses(FakeJni::Jvm* vm)
     vm->registerClass<jnivm::android::media::MediaRouter>();
     vm->registerClass<jnivm::android::media::AudioDeviceInfo>();
     vm->registerClass<jnivm::android::media::AudioManager>();
+    vm->registerClass<jnivm::android::media::AudioTrack>();
 
     // OS
     vm->registerClass<jnivm::android::os::Build>();

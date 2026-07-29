@@ -23,6 +23,27 @@ bool jnivm::android::media::AudioManager::isBluetoothA2dpOn()
     return false;
 }
 
+bool jnivm::android::media::AudioManager::isBluetoothScoOn()
+{
+    return false;
+}
+
+// Whether *another* app is playing audio. Nothing else is running here.
+bool jnivm::android::media::AudioManager::isMusicActive()
+{
+    return false;
+}
+
+///// AudioTrack
+
+// Keep this in step with AudioManager::getProperty's PROPERTY_OUTPUT_SAMPLE_RATE
+// -- an engine that reads both and gets different answers will size its buffers
+// against one rate and resample to the other.
+int jnivm::android::media::AudioTrack::getNativeOutputSampleRate(int streamType)
+{
+    return 24000;
+}
+
 std::shared_ptr<FakeJni::JString> jnivm::android::media::AudioManager::getProperty(std::shared_ptr<FakeJni::JString> property)
 {
     if (*property == PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
@@ -72,9 +93,15 @@ BEGIN_NATIVE_DESCRIPTOR(jnivm::android::media::AudioDeviceInfo) { FakeJni::Const
     { FakeJni::Field<&AudioManager::GET_DEVICES_OUTPUTS> {}, "GET_DEVICES_OUTPUTS", FakeJni::JFieldID::STATIC },
     { FakeJni::Field<&AudioManager::STREAM_MUSIC> {}, "STREAM_MUSIC", FakeJni::JFieldID::STATIC },
     { FakeJni::Function<&AudioManager::isBluetoothA2dpOn> {}, "isBluetoothA2dpOn", FakeJni::JMethodID::PUBLIC },
+    { FakeJni::Function<&AudioManager::isBluetoothScoOn> {}, "isBluetoothScoOn", FakeJni::JMethodID::PUBLIC },
+    { FakeJni::Function<&AudioManager::isMusicActive> {}, "isMusicActive", FakeJni::JMethodID::PUBLIC },
     { FakeJni::Function<&AudioManager::getProperty> {}, "getProperty", FakeJni::JMethodID::PUBLIC },
     { FakeJni::Function<&AudioManager::getDevices> {}, "getDevices", FakeJni::JMethodID::PUBLIC },
     { FakeJni::Function<&AudioManager::getStreamVolume> {}, "getStreamVolume", FakeJni::JMethodID::PUBLIC },
+    END_NATIVE_DESCRIPTOR
+
+    BEGIN_NATIVE_DESCRIPTOR(jnivm::android::media::AudioTrack) { FakeJni::Constructor<AudioTrack> {} },
+    { FakeJni::Function<&AudioTrack::getNativeOutputSampleRate> {}, "getNativeOutputSampleRate", FakeJni::JMethodID::STATIC },
     END_NATIVE_DESCRIPTOR
 
     BEGIN_NATIVE_DESCRIPTOR(jnivm::android::media::MediaRouterRouteInfo) { FakeJni::Constructor<MediaRouterRouteInfo> {} },
