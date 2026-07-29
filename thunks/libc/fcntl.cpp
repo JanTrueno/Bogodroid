@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <cerrno>
+#include <stdarg.h>   // openat_impl is variadic
 
 char* clean_jar_path(const char* path) {
     if (!path) return NULL;
@@ -283,5 +284,28 @@ ABI_ATTR int flock_impl(int fd, int operation) {
     int cmd = (operation & LOCK_NB) ? F_SETLK : F_SETLKW;
 
     return fcntl(fd, cmd, &fl);
+}
+
+// openat() is variadic, so generate_libc.py skips it (see the "TODO impl
+// variadic" entry in impl_tab.h). libc++_shared.so imports it for
+// std::filesystem, so provide it by hand.
+//
+// dirfd is ignored: the loader chdir's into the game directory at startup and
+// every path the runtime opens is either absolute or already relative to it,
+// which is the same assumption the ct_nx Switch port makes. Delegating to
+// open_impl rather than open() keeps the path rewriting (clean_jar_path, the
+// /sys/devices/system/cpu redirects) that open_impl applies.
+extern "C" ABI_ATTR int openat_impl(int dirfd, const char *filename, int flags, ...)
+{
+    (void)dirfd;
+    mode_t mode = 0666;
+    if (flags & O_CREAT)
+    {
+        va_list va;
+        va_start(va, flags);
+        mode = (mode_t)va_arg(va, int);
+        va_end(va);
+    }
+    return open_impl(filename, flags, mode);
 }
 

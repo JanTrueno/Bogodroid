@@ -243,6 +243,28 @@ int main(int argc, char *argv[])
     if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0)
         printf("SDL gamecontroller init failed (%s) -- keyboard only\n", SDL_GetError());
 
+    // ---- load the C++ runtime first ----
+    //
+    // libLimbo.so links against libc++_shared.so (it is in its DT_NEEDED) and
+    // imports 36 symbols from it -- std::string/ofstream methods, operator
+    // new/delete, __cxa_guard_*. Nothing in thunks/ provides those, so they can
+    // only be resolved out of the shipped runtime .so.
+    //
+    // Order matters twice over. so_load() relocates a module against every
+    // module already in the chain and then runs its init_array, so libc++ has
+    // to be in place before libLimbo is relocated, and its static constructors
+    // (which build std::cout/cerr and the locale tables) have to run before the
+    // game's. Loading it first gets both for free. Same sequence the ct_nx
+    // Switch port uses for libchrono.so.
+    printf("Loading libc++_shared\n");
+    so_module lcpp = {};
+    const char *path_lcpp = "arm64-v8a/libc++_shared.so";
+    if (!load_so_from_file(&lcpp, path_lcpp, 0x40000000))
+    {
+        printf("Failed to load %s -- libLimbo's std:: imports cannot resolve.\n", path_lcpp);
+        return 1;
+    }
+
     printf("Loading libLimbo\n");
     so_module lmain = {};
     uintptr_t addr_lmain = 0x50000000;

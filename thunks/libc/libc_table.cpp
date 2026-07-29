@@ -63,6 +63,15 @@ extern const char *_ctype_impl;
 extern const short *_tolower_tab_impl;
 extern const short *_toupper_tab_impl;
 
+// Hand-written shims for symbols generate_libc.py cannot emit, so they are not
+// declared by the generated impl_header.h. Definitions live in fcntl.cpp
+// (openat) and misc.cpp (the rest).
+extern "C" ABI_ATTR int openat_impl(int dirfd, const char *filename, int flags, ...);
+extern "C" ABI_ATTR int statvfs_impl(const char *path, void *buf);
+extern "C" ABI_ATTR int __register_atfork_impl(void (*prepare)(void), void (*parent)(void),
+                                               void (*child)(void), void *dso);
+extern "C" ABI_ATTR void *__emutls_get_address_impl(void *control);
+
 DynLibFunction symtable_libc[] = {
     // Symbols picked up by generate_libc.py
     #include "impl_tab.h"
@@ -97,5 +106,17 @@ DynLibFunction symtable_libc[] = {
 #if defined(__arm__)
     {"__gnu_Unwind_Find_exidx", (uintptr_t)&__gnu_Unwind_Find_exidx},
 #endif
+
+    // Symbols generate_libc.py cannot emit (variadic, or THUNK_MISSING in
+    // impl_tab.h). A game that ships its own libc++_shared.so needs these:
+    // openat/statvfs are imported by the runtime's std::filesystem, and
+    // __emutls_get_address by any .so whose thread_local went through emutls.
+    {"openat", (uintptr_t)&openat_impl},
+    {"openat64", (uintptr_t)&openat_impl},
+    {"statvfs", (uintptr_t)&statvfs_impl},
+    {"statvfs64", (uintptr_t)&statvfs_impl},
+    {"__register_atfork", (uintptr_t)&__register_atfork_impl},
+    {"__emutls_get_address", (uintptr_t)&__emutls_get_address_impl},
+
     {NULL, (uintptr_t)NULL}
 };

@@ -18,6 +18,7 @@
 #include <inttypes.h>
 #include <link.h>
 #include <stdbool.h>
+#include <pthread.h>   // emulated-TLS storage (__emutls_get_address_impl)
 
 
 
@@ -656,4 +657,153 @@ extern ABI_ATTR int strerror_r_impl(int errnum, char *buf, size_t buflen)
 ABI_ATTR int fnmatch_impl(const char *pattern, const char *string, int flags)
 {
     return fnmatch(pattern, string, flags);
+}
+
+// ---------------------------------------------------------------------------
+// Symbols generate_libc.py could not emit (they are THUNK_MISSING/variadic in
+// impl_tab.h), needed once a game ships its own libc++_shared.so.
+// ---------------------------------------------------------------------------
+
+// bionic keeps fork handlers per-DSO; nothing here ever forks, so accept and
+// ignore the registration rather than failing the caller. Matches how the
+// ct_nx Switch port stubs it.
+extern "C" ABI_ATTR int __register_atfork_impl(void (*prepare)(void), void (*parent)(void),
+                                               void (*child)(void), void *dso)
+{
+    (void)prepare; (void)parent; (void)child; (void)dso;
+    return 0;
+}
+
+// bionic's struct statvfs (aarch64). The host's layout is NOT identical, so the
+// fields are written through this local definition rather than by calling the
+// host statvfs() -- getting this wrong silently corrupts the caller's buffer.
+//
+// Reporting zeroes would read as a full disk and block saves, so report a large
+// filesystem (same reasoning and values as ct_nx's statvfs_fake).
+struct bionic_statvfs {
+    unsigned long f_bsize, f_frsize;
+    uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail;
+    unsigned long f_fsid, f_flag, f_namemax;
+    uint32_t __reserved[6];
+};
+
+extern "C" ABI_ATTR int statvfs_impl(const char *path, void *buf)
+{
+    (void)path;
+    if (!buf)
+        return -1;
+    bionic_statvfs *s = (bionic_statvfs *)buf;
+    memset(s, 0, sizeof(*s));
+    s->f_bsize = 0x1000;
+    s->f_frsize = 0x1000;
+    s->f_blocks = 256ull * 1024 * 1024;   // ~1 TiB of 4 KiB blocks
+    s->f_bfree = 256ull * 1024 * 1024;
+    s->f_bavail = 256ull * 1024 * 1024;
+    s->f_files = 1ull << 20;
+    s->f_ffree = 1ull << 20;
+    s->f_favail = 1ull << 20;
+    s->f_namemax = 255;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Emulated TLS (compiler-rt's __emutls_get_address).
+//
+// The NDK compiles thread_local through emutls when it cannot use native TLS,
+// so a game .so can import this even though the host toolchain never emits it.
+// Layout below is compiler-rt's __emutls_control and must not be reordered.
+//
+// Each control block is assigned a 1-based index on first use; every thread
+// keeps its own slot array in a pthread_key, so the storage is genuinely
+// per-thread (returning one shared block would silently alias threads).
+// ---------------------------------------------------------------------------
+
+struct emutls_control {
+    size_t size;
+    size_t align;
+    union {
+        uintptr_t index;
+        void *address;
+    } object;
+    void *value;   // initialiser template; NULL means zero-fill
+};
+
+struct emutls_array {
+    uintptr_t size;
+    void **slots;
+};
+
+static pthread_key_t emutls_key;
+static pthread_once_t emutls_key_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t emutls_index_lock = PTHREAD_MUTEX_INITIALIZER;
+static uintptr_t emutls_next_index = 1;   // 0 means "not yet assigned"
+
+static void emutls_destroy(void *p)
+{
+    emutls_array *arr = (emutls_array *)p;
+    if (!arr)
+        return;
+    for (uintptr_t i = 0; i < arr->size; i++)
+        free(arr->slots[i]);
+    free(arr->slots);
+    free(arr);
+}
+
+static void emutls_key_create(void)
+{
+    pthread_key_create(&emutls_key, emutls_destroy);
+}
+
+extern "C" ABI_ATTR void *__emutls_get_address_impl(void *control)
+{
+    emutls_control *c = (emutls_control *)control;
+    if (!c)
+        return NULL;
+
+    pthread_once(&emutls_key_once, emutls_key_create);
+
+    uintptr_t index = __atomic_load_n(&c->object.index, __ATOMIC_ACQUIRE);
+    if (index == 0) {
+        pthread_mutex_lock(&emutls_index_lock);
+        index = c->object.index;
+        if (index == 0) {
+            index = emutls_next_index++;
+            __atomic_store_n(&c->object.index, index, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&emutls_index_lock);
+    }
+
+    emutls_array *arr = (emutls_array *)pthread_getspecific(emutls_key);
+    if (!arr) {
+        arr = (emutls_array *)calloc(1, sizeof(emutls_array));
+        if (!arr)
+            return NULL;
+        pthread_setspecific(emutls_key, arr);
+    }
+    if (arr->size < index) {
+        const uintptr_t newsize = index + 8;
+        void **slots = (void **)realloc(arr->slots, newsize * sizeof(void *));
+        if (!slots)
+            return NULL;
+        memset(slots + arr->size, 0, (newsize - arr->size) * sizeof(void *));
+        arr->slots = slots;
+        arr->size = newsize;
+    }
+
+    void *obj = arr->slots[index - 1];
+    if (!obj) {
+        size_t align = c->align ? c->align : sizeof(void *);
+        if (align < sizeof(void *))
+            align = sizeof(void *);
+        if (align & (align - 1))          // posix_memalign demands a power of two
+            align = sizeof(void *);
+        if (posix_memalign(&obj, align, c->size ? c->size : 1) != 0)
+            return NULL;
+        if (c->value)
+            memcpy(obj, c->value, c->size);
+        else
+            memset(obj, 0, c->size);
+        arr->slots[index - 1] = obj;
+    }
+    return obj;
 }

@@ -270,6 +270,21 @@ EGLSurface eglCreateWindowSurface_impl(EGLDisplay display, EGLConfig config, Nat
     return egl_surface;
 }
 
+// Pbuffer (offscreen) surfaces. There is only ever the one real SDL surface
+// here, so hand that back rather than creating a second drawable -- the same
+// shortcut eglCreateWindowSurface_impl takes. Engines request a pbuffer to keep
+// a context current on a worker thread while nothing is being presented, which
+// this satisfies; anything that actually renders into it and expects the result
+// to stay off-screen would need a real FBO-backed surface.
+EGLSurface eglCreatePbufferSurface_impl(EGLDisplay display, EGLConfig config, EGLint const* attrib_list)
+{
+    verbose("EGL_SDL", "eglCreatePbufferSurface\n");
+#ifdef FAKE_EGL
+    return (EGLSurface)0xDEAD;
+#endif
+    return egl_surface;
+}
+
 EGLBoolean eglQuerySurface_impl(EGLDisplay display, EGLSurface surface, EGLint attribute, EGLint* value)
 {
     verbose("EGL_SDL", "eglQuerySurface\n");
@@ -367,6 +382,7 @@ DynLibFunction symtable_egl_sdl[] = {
     NO_THUNK("eglInitialize", (uintptr_t)&eglInitialize_impl),
     NO_THUNK("eglChooseConfig", (uintptr_t)&eglChooseConfig_impl),
     NO_THUNK("eglCreateWindowSurface", (uintptr_t)&eglCreateWindowSurface_impl),
+    NO_THUNK("eglCreatePbufferSurface", (uintptr_t)&eglCreatePbufferSurface_impl),
     NO_THUNK("eglQuerySurface", (uintptr_t)&eglQuerySurface_impl),
     NO_THUNK("eglCreateContext", (uintptr_t)&eglCreateContext_impl),
     NO_THUNK("eglMakeCurrent", (uintptr_t)&eglMakeCurrent_impl),
