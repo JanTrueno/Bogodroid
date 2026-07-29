@@ -70,7 +70,6 @@ extern "C" ABI_ATTR int openat_impl(int dirfd, const char *filename, int flags, 
 extern "C" ABI_ATTR int statvfs_impl(const char *path, void *buf);
 extern "C" ABI_ATTR int __register_atfork_impl(void (*prepare)(void), void (*parent)(void),
                                                void (*child)(void), void *dso);
-extern "C" ABI_ATTR void *__emutls_get_address_impl(void *control);
 
 DynLibFunction symtable_libc[] = {
     // Symbols picked up by generate_libc.py
@@ -108,15 +107,14 @@ DynLibFunction symtable_libc[] = {
 #endif
 
     // Symbols generate_libc.py cannot emit (variadic, or THUNK_MISSING in
-    // impl_tab.h). A game that ships its own libc++_shared.so needs these:
-    // openat/statvfs are imported by the runtime's std::filesystem, and
-    // __emutls_get_address by any .so whose thread_local went through emutls.
+    // impl_tab.h). openat/statvfs are imported by libc++_shared.so's
+    // std::filesystem; __register_atfork by bionic-built game code.
+    // (__emutls_get_address is intentionally absent -- see the note in misc.cpp.)
     {"openat", (uintptr_t)&openat_impl},
     {"openat64", (uintptr_t)&openat_impl},
     {"statvfs", (uintptr_t)&statvfs_impl},
     {"statvfs64", (uintptr_t)&statvfs_impl},
     {"__register_atfork", (uintptr_t)&__register_atfork_impl},
-    {"__emutls_get_address", (uintptr_t)&__emutls_get_address_impl},
 
     {NULL, (uintptr_t)NULL}
 };

@@ -18,7 +18,6 @@
 #include <inttypes.h>
 #include <link.h>
 #include <stdbool.h>
-#include <pthread.h>   // emulated-TLS storage (__emutls_get_address_impl)
 
 
 
@@ -731,104 +730,17 @@ extern "C" ABI_ATTR int statvfs_impl(const char *path, void *buf)
     return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Emulated TLS (compiler-rt's __emutls_get_address).
+// NOTE: __emutls_get_address is deliberately NOT shimmed here.
 //
-// The NDK compiles thread_local through emutls when it cannot use native TLS,
-// so a game .so can import this even though the host toolchain never emits it.
-// Layout below is compiler-rt's __emutls_control and must not be reordered.
+// A game that ships libc++_shared.so already carries the NDK's own compiler-rt
+// build of it (it is a DEFINED symbol in that .so), ABI-matched to the game by
+// construction. so_resolve_link() searches these host tables BEFORE the loaded
+// modules, so registering a shim here would shadow that correct implementation
+// with ours -- and split the emutls store in two, since each implementation
+// keeps its own index counter and per-thread slot array.
 //
-// Each control block is assigned a 1-based index on first use; every thread
-// keeps its own slot array in a pthread_key, so the storage is genuinely
-// per-thread (returning one shared block would silently alias threads).
-// ---------------------------------------------------------------------------
-
-struct emutls_control {
-    size_t size;
-    size_t align;
-    union {
-        uintptr_t index;
-        void *address;
-    } object;
-    void *value;   // initialiser template; NULL means zero-fill
-};
-
-struct emutls_array {
-    uintptr_t size;
-    void **slots;
-};
-
-static pthread_key_t emutls_key;
-static pthread_once_t emutls_key_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t emutls_index_lock = PTHREAD_MUTEX_INITIALIZER;
-static uintptr_t emutls_next_index = 1;   // 0 means "not yet assigned"
-
-static void emutls_destroy(void *p)
-{
-    emutls_array *arr = (emutls_array *)p;
-    if (!arr)
-        return;
-    for (uintptr_t i = 0; i < arr->size; i++)
-        free(arr->slots[i]);
-    free(arr->slots);
-    free(arr);
-}
-
-static void emutls_key_create(void)
-{
-    pthread_key_create(&emutls_key, emutls_destroy);
-}
-
-extern "C" ABI_ATTR void *__emutls_get_address_impl(void *control)
-{
-    emutls_control *c = (emutls_control *)control;
-    if (!c)
-        return NULL;
-
-    pthread_once(&emutls_key_once, emutls_key_create);
-
-    uintptr_t index = __atomic_load_n(&c->object.index, __ATOMIC_ACQUIRE);
-    if (index == 0) {
-        pthread_mutex_lock(&emutls_index_lock);
-        index = c->object.index;
-        if (index == 0) {
-            index = emutls_next_index++;
-            __atomic_store_n(&c->object.index, index, __ATOMIC_RELEASE);
-        }
-        pthread_mutex_unlock(&emutls_index_lock);
-    }
-
-    emutls_array *arr = (emutls_array *)pthread_getspecific(emutls_key);
-    if (!arr) {
-        arr = (emutls_array *)calloc(1, sizeof(emutls_array));
-        if (!arr)
-            return NULL;
-        pthread_setspecific(emutls_key, arr);
-    }
-    if (arr->size < index) {
-        const uintptr_t newsize = index + 8;
-        void **slots = (void **)realloc(arr->slots, newsize * sizeof(void *));
-        if (!slots)
-            return NULL;
-        memset(slots + arr->size, 0, (newsize - arr->size) * sizeof(void *));
-        arr->slots = slots;
-        arr->size = newsize;
-    }
-
-    void *obj = arr->slots[index - 1];
-    if (!obj) {
-        size_t align = c->align ? c->align : sizeof(void *);
-        if (align < sizeof(void *))
-            align = sizeof(void *);
-        if (align & (align - 1))          // posix_memalign demands a power of two
-            align = sizeof(void *);
-        if (posix_memalign(&obj, align, c->size ? c->size : 1) != 0)
-            return NULL;
-        if (c->value)
-            memcpy(obj, c->value, c->size);
-        else
-            memset(obj, 0, c->size);
-        arr->slots[index - 1] = obj;
-    }
-    return obj;
-}
+// If a future port imports __emutls_get_address without shipping a runtime that
+// defines it, the loader prints "Missing: __emutls_get_address" and points the
+// PLT slot at plt0_stub, which is a diagnosable failure rather than a silently
+// wrong one. Resolve that by loading the runtime .so, not by reimplementing the
+// emutls ABI here.
