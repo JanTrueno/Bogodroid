@@ -13,16 +13,31 @@ android_cache="cache/"
 
 [package]
 
-packageName="com.example.package"
-versionName="0.1"
+packageName="com.playdead.limbo"
+versionName="1.20"
 mainIntentBundle = {}
 
 
 [device]
 
-displayWidth=640
-displayHeight=480
+displayWidth=1280
+displayHeight=720
 displayRotation=0
+fullscreen=false
+
+# Limbo is a landscape game with digital controls.
+displayTouchscreen=1
+displayDensity=160
+language="en"
+country="US"
 
 
+[input]
 
+# Gamepad support. Limbo takes input through the native AInputQueue rather than
+# JNI, so limboloader translates SDL controller events itself (see
+# projects/limboloader/main.cpp) -- this flag is read by
+# platform/common/input_backend.cpp, which limboloader does not use.
+controller=true
+touch_mode=false
+accurate_mode=false

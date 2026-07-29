@@ -119,6 +119,15 @@ off64_t AAsset_getLength64(AAsset* asset) {
     return asset->length;
 }
 
+off_t AAsset_getRemainingLength(AAsset* asset) {
+    return (off_t)AAsset_getRemainingLength64(asset);
+}
+
+off64_t AAsset_getRemainingLength64(AAsset* asset) {
+    off64_t remaining = asset->length - asset->pos;
+    return remaining > 0 ? remaining : 0;
+}
+
 int AAsset_read(AAsset* asset, void* buf, size_t count) {
     if(asset->buffer) {
         size_t remain = asset->length - asset->pos;

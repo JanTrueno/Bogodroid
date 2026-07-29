@@ -166,18 +166,29 @@ typedef struct ANativeActivityCallbacks {
 
 
 
+// Build the ANativeActivity handed to ANativeActivity_onCreate and to every
+// lifecycle callback.
+//
+// `env` is the caller's: it is stored in the returned struct and stays live for
+// as long as the activity does, because native code reaches back into Java
+// through it (activity->env->CallVoidMethod(activity->clazz, ...)). It MUST
+// come from a FakeJni::LocalFrame that outlives the activity -- typically one
+// declared in the loader's main().
+//
+// Taking it as a parameter is deliberate. This function used to create its own
+// LocalFrame and return &frame.getJniEnv(); the frame is an RAII scope guard,
+// so it destructed on return and left every caller holding a pointer into dead
+// stack. That reads as working right up until something reuses the stack.
 template <typename T>
-ANativeActivity ANativeActivity_create(FakeJni::Jvm *vm, const std::string& assetPath) {
-        ANativeActivity nActivity;
-        FakeJni::LocalFrame frame(*vm);
+ANativeActivity ANativeActivity_create(FakeJni::Jvm *vm, JNIEnv *env, const std::string& assetPath) {
+        // Value-initialised rather than memset: the struct holds a shared_ptr,
+        // and memset over a non-trivial type is undefined behaviour.
+        ANativeActivity nActivity = {};
 
-        memset(&nActivity, 0, sizeof(ANativeActivity));
-
-        nActivity.callbacks = new ANativeActivityCallbacks;
-        memset(nActivity.callbacks, 0, sizeof(ANativeActivityCallbacks));
+        nActivity.callbacks = new ANativeActivityCallbacks {};
 
         nActivity.vm = vm;
-        nActivity.env = &(frame.getJniEnv());
+        nActivity.env = env;
 
         nActivity.clazz = std::make_shared<T>();
 

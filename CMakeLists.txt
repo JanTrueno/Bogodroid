@@ -118,6 +118,7 @@ add_executable(${CMAKE_PROJECT_NAME}
     thunks/ndk/ndk.cpp
     thunks/ndk/alooper.c
     thunks/ndk/asset_manager.c
+    thunks/ndk/ainput.c
 
     thunks/khronos/egl.cpp
     thunks/khronos/gles2.cpp
@@ -191,6 +192,7 @@ file(GLOB LIBC_THUNK_FILES "thunks/libc/*.cpp")
 set_source_files_properties(
     thunks/ndk/alooper.c
     thunks/ndk/asset_manager.c
+    thunks/ndk/ainput.c
     loader/so_util.cpp
     thunks/egl_sdl/egl_sdl.cpp
     ${LIBC_THUNK_FILES}

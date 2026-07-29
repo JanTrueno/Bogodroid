@@ -132,8 +132,9 @@ See `tools/unity_traces` for a trace of a minimal Unity game starting up
 |-----------------------------------|---------------|---------------|--------------------------------------------------------------------------------------------------------------------|
 | Unity 2021.3f (aarch64 il2cpp)                      | unityloader   | Working  | Runs simple games. Graphics, audio and input work. |
 | Unity 2021.3f (aarch64 mono)                      | unityloader   | Working POC  | Simple demos and benchmarks are working, with low but reasonable performance. Implementation is still incomplete. |
+| Professor Layton and the Curious Village HD | laytonloader | Working | Graphics, audio, touch/keyboard input and cutscenes work. |
 | Super Hexagon                     | hexagonloader | Not Booting   | Unchanged from Pre-NEO Bogodroid, needs complete rework  |
-| Limbo                             | limboloader   | Loading Screen| Unchanged from Pre-NEO Bogodroid, needs complete rework  |
+| Limbo                             | limboloader   | Untested      | Reworked for NEO (arm64). Full ANativeActivity lifecycle, native AInputQueue input (gamepad + keyboard), asset manager and OpenSL ES audio. Not yet run on hardware. |
 | Crazy Taxi Classic                | taxiloader    | Investigated  | Requires better file handling for loading the big OBB files, before it can be attempted.                           |
 | Terraria                          | -             | Not attempted | (Engine: FNA, Monogame port might be easier)                                                                       |
 | Baba is you                       | -             | Not attempted |                                                                                                                    |

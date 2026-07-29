@@ -84,8 +84,12 @@ int main(int argc, char *argv[])
     return 1;
     }
 
-    // Create the ANativeActivity and NativeActivity bindings
-    ANativeActivity nActivity = ANativeActivity_create<jnivm::com::sample::teapot::TeapotNativeActivity>(&vm, "assets");
+    // Create the ANativeActivity and NativeActivity bindings.
+    // The frame owns the JNIEnv the activity hands to native code, so it has to
+    // outlive the activity -- keep it here in main() for the whole run.
+    FakeJni::LocalFrame frame(vm);
+    JNIEnv *env = &frame.getJniEnv();
+    ANativeActivity nActivity = ANativeActivity_create<jnivm::com::sample::teapot::TeapotNativeActivity>(&vm, env, "assets");
 
     // Fetch pointer to ANativeActivity_onCreate from the so file...
     printf("calling ANativeActivity_onCreate from libTeapot\n");
