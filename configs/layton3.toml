@@ -1,0 +1,48 @@
+[paths]
+
+game_files="../gamefiles/layton3/"
+support_files="../gamefiles/support_files/"
+
+android_package_code="/fakepath_package_code"
+android_external_files="/fakepath_external_files"
+android_files="/fakepath_files"
+android_obb_dirs=["/fakepath_obb"]
+android_source_dirs=["/fakepath_source"]
+android_cache="cache/"
+
+
+[package]
+
+packageName="com.Level5.LT3R"
+versionName="1.0.3"
+mainIntentBundle = {}
+
+
+[device]
+
+# Window size (ignored when fullscreen -- the drawable size is queried from
+# SDL instead).
+displayWidth=1920
+displayHeight=1080
+fullscreen=true
+
+# Orientation of the game view:
+#   0        landscape -- the game fills the panel as-is
+#   90 / 270 portrait  -- the DS layout (two screens stacked) is rendered
+#                         portrait and rotated onto a widescreen panel; use
+#                         270 if 90 comes out upside down for how you hold it
+#   180      landscape, flipped
+# L1 / R1 rotate this at runtime, so it is easy to find the one you want.
+displayRotation=90
+
+# BCP-47-ish short code the loader maps to the engine's numeric language id
+# (MainActivity::OS_GetDeviceLanguage, javastubs/layton3.cpp). One of:
+# en, es, fr, it, de. Anything else falls back to English.
+language="en"
+
+
+[input]
+
+# Pointer speed multiplier for the stick and d-pad. The base speed already
+# scales with the display, so this is only for taste.
+cursorSpeed=1.0
