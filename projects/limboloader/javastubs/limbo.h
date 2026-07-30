@@ -67,18 +67,29 @@ namespace jnivm
                     LimboActivity();
                 };
 
-                // Age-gate helper (GDPR/COPPA signals). nativeInit is exported by
-                // libLimbo.so and registers this class's natives; with no Play
-                // Services present the object just has to exist.
+                // Age-gate helper (GDPR/COPPA signals).
                 //
-                // isAgeResolved appears in the binary's string table, so the
-                // engine reads it -- report resolved so a startup gate waiting on
-                // an age check cannot stall.
+                // native_LimboAgeSignals_nativeInit (decompiled) does:
+                //   classRef  = NewGlobalRef(env, <this class>)          -- JNIEnv+0xa8,  idx 21
+                //   methodId  = GetStaticMethodID(env, classRef,
+                //                   "isAgeResolved", <sig>)              -- JNIEnv+0x388, idx 113
+                // i.e. isAgeResolved is a STATIC METHOD looked up via
+                // GetStaticMethodID, not a field via GetFieldID -- a field
+                // registration here does not satisfy that lookup.
+                //
+                // nativeInit is JNI-registered so *Java* calls *native*, same
+                // direction as JNI_OnLoad, not the native_Report*/native_Device*
+                // exports (which the loader calls itself). On real Android,
+                // MainActivity's onCreate calls LimboAgeSignals.nativeInit()
+                // once at startup; the loader has to do that too (see
+                // projects/limboloader/main.cpp) or the class ref + method id
+                // it caches stay null and a later isAgeResolved() call reads as
+                // permanently unresolved.
                 class LimboAgeSignals : public FakeJni::JObject
                 {
                 public:
                     DEFINE_CLASS_NAME("com/playdead/limbo/LimboAgeSignals")
-                    bool isAgeResolved = true;
+                    static bool isAgeResolved();
                 };
             }
         }

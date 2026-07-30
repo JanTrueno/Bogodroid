@@ -291,6 +291,28 @@ int main(int argc, char *argv[])
     if (jniOnLoad)
         jniOnLoad(&vm, nullptr);
 
+    // On real Android, MainActivity's onCreate calls LimboAgeSignals.nativeInit()
+    // once at startup -- Java calling into native, the opposite direction from
+    // every native_Report*/native_Device* export below, so it never gets called
+    // by anything the engine itself drives. Decompiling it (Java_com_playdead_
+    // limbo_LimboAgeSignals_nativeInit) shows it does NewGlobalRef(env, class)
+    // then GetStaticMethodID(env, classRef, "isAgeResolved", ...) and caches
+    // both; skip this and any later isAgeResolved() call goes through a null
+    // class ref / method id, reading (or crashing into) "never resolved" --
+    // exactly the shape of a stuck-at-title-with-no-progress symptom. The
+    // loader has to make this call itself since there is no real Java side to.
+    {
+        auto ageSignalsEnv = jnivm::ENV::FromJNIEnv(env);
+        auto ageSignalsClass = vm.findClass("com/playdead/limbo/LimboAgeSignals");
+        jclass ageSignalsClassObj =
+            jnivm::JNITypes<std::shared_ptr<jnivm::Class>>::ToJNIType(ageSignalsEnv, ageSignalsClass);
+        auto ageSignalsInit = (void (*)(JNIEnv *, jclass))so_symbol(&lmain,
+            "Java_com_playdead_limbo_LimboAgeSignals_nativeInit");
+        printf("LimboAgeSignals.nativeInit=%p\n", (void *)ageSignalsInit);
+        if (ageSignalsInit)
+            ageSignalsInit(env, ageSignalsClassObj);
+    }
+
     auto reportVSync = (reportVSync_t)so_symbol(&lmain,
         "Java_com_playdead_limbo_LimboActivity_native_1ReportVSyncCallEvent");
     auto deviceAdded = (deviceChanged_t)so_symbol(&lmain,

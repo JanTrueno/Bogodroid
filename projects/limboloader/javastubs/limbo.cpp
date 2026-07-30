@@ -87,7 +87,14 @@ BEGIN_NATIVE_DESCRIPTOR(jnivm::com::playdead::limbo::LimboActivity)
 { FakeJni::Field<&LimboActivity::gamepadAxisMaxVals> {}, "gamepadAxisMaxVals", FakeJni::JFieldID::PUBLIC },
 END_NATIVE_DESCRIPTOR
 
+// Report resolved so any engine code that calls this through the method id
+// nativeInit cached cannot read "unresolved" and block on it.
+bool jnivm::com::playdead::limbo::LimboAgeSignals::isAgeResolved()
+{
+    return true;
+}
+
 BEGIN_NATIVE_DESCRIPTOR(jnivm::com::playdead::limbo::LimboAgeSignals)
 { FakeJni::Constructor<LimboAgeSignals> {} },
-{ FakeJni::Field<&LimboAgeSignals::isAgeResolved> {}, "isAgeResolved", FakeJni::JFieldID::PUBLIC },
+{ FakeJni::Function<&LimboAgeSignals::isAgeResolved> {}, "isAgeResolved", FakeJni::JMethodID::STATIC },
 END_NATIVE_DESCRIPTOR
