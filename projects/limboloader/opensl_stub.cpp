@@ -400,7 +400,28 @@ static const void *cfg_vtbl[] = {
 
 // --- SLObjectItf (shared by engine, output mix, player) ---
 
-static SLresult obj_Realize(void *self, SLboolean async) { (void)self; (void)async; return SL_RESULT_SUCCESS; }
+// Declared here rather than below the engine vtable so the tracing in
+// obj_Realize can name which object is being realized.
+enum { OBJ_ENGINE, OBJ_MIX, OBJ_PLAYER };
+
+struct Object {
+    const void *objVtbl; // must be first: this is the SLObjectItf the game holds
+    int kind;
+    const void *engVtbl; // for OBJ_ENGINE
+    Player *player;      // for OBJ_PLAYER
+};
+
+static SLresult obj_Realize(void *self, SLboolean async)
+{
+    // Traced: Wwise realizes the engine, then the output mix, then the player.
+    // Seeing where the sequence stops localises an audio-init failure that
+    // otherwise produces no output at all.
+    Object *o = (Object *)self;
+    printf("opensl: Realize(kind=%d)\n", o ? o->kind : -1);
+    fflush(stdout);
+    (void)async;
+    return SL_RESULT_SUCCESS;
+}
 static SLresult obj_Resume(void *self, SLboolean async) { (void)self; (void)async; return SL_RESULT_SUCCESS; }
 static SLresult obj_GetState(void *self, SLuint32 *pState) { (void)self; if (pState) *pState = 2 /*REALIZED*/; return SL_RESULT_SUCCESS; }
 static SLresult obj_GetInterface(void *self, const void *iid, void *pInterface);
@@ -445,15 +466,6 @@ static const void *eng_vtbl[] = {
     (void *)eng_ret, // QueryNumSupportedExtensions
     (void *)eng_ret, // QuerySupportedExtension
     (void *)eng_ret, // IsExtensionSupported
-};
-
-enum { OBJ_ENGINE, OBJ_MIX, OBJ_PLAYER };
-
-struct Object {
-    const void *objVtbl; // must be first: this is the SLObjectItf the game holds
-    int kind;
-    const void *engVtbl; // for OBJ_ENGINE
-    Player *player;       // for OBJ_PLAYER
 };
 
 static SLresult obj_GetInterface(void *self, const void *iid, void *pInterface)
@@ -517,6 +529,8 @@ static SLresult eng_CreateOutputMix(void *self, void **pMix, SLuint32 numIfaces,
     o->objVtbl = obj_vtbl;
     o->kind = OBJ_MIX;
     *pMix = o;
+    printf("opensl: CreateOutputMix\n");
+    fflush(stdout);
     return SL_RESULT_SUCCESS;
 }
 
@@ -594,6 +608,10 @@ static uint32_t slCreateEngine_stub(void **pEngine, uint32_t numOptions, const v
     o->kind = OBJ_ENGINE;
     o->engVtbl = eng_vtbl;
     *pEngine = o;
+    // First call the audio middleware makes. If this never prints, the failure
+    // is upstream of OpenSL entirely and no audio backend was even attempted.
+    printf("opensl: slCreateEngine\n");
+    fflush(stdout);
     return SL_RESULT_SUCCESS;
 }
 

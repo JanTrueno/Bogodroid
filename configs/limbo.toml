@@ -29,8 +29,17 @@ displayHeight=720
 displayRotation=0
 fullscreen=false
 
-# Limbo is a landscape game with digital controls.
-displayTouchscreen=1
+# AConfiguration_getTouchscreen: 1 = NOTOUCH, 2 = STYLUS, 3 = FINGER.
+# This MUST be 3 -- Limbo's front end is touch-driven, and a game told there is
+# no touchscreen can disable that input path outright.
+displayTouchscreen=3
+
+# AConfiguration_getOrientation: 1 = PORT, 2 = LAND. Note that thunks/ndk/ndk.cpp
+# reads this from displayRotation, which laytonloader instead uses as a rotation
+# in degrees -- the same key means different things to the two loaders. Limbo
+# does no rotation, so it is safe to use it as the orientation enum here.
+displayRotation=2
+
 displayDensity=160
 language="en"
 country="US"

@@ -111,9 +111,17 @@ typedef void (*reportGameServices_t)(JNIEnv *, jobject, jint state);
 // KeyEvent.KEYCODE_*, so the mapping below matches input_backend.cpp's.
 // ---------------------------------------------------------------------------
 
+// Device ids reported to native_DeviceAdded and carried on every event. These
+// deliberately match platform/common/input_backend.cpp's INPUT_ID_* values so a
+// game that also asks Java about a device by id gets a consistent answer.
 #define LIMBO_DEVICE_KEYBOARD 1
 #define LIMBO_DEVICE_GAMEPAD 2
 #define LIMBO_DEVICE_MOUSE 3
+#define LIMBO_DEVICE_TOUCH 4
+
+// Whether the mouse button is held -- a touchscreen only reports ACTION_MOVE
+// between a DOWN and an UP, so hovering must not generate motion.
+static bool mouse_down = false;
 
 // AKEYCODE_* (android/keycodes.h)
 enum {
@@ -365,6 +373,17 @@ int main(int argc, char *argv[])
     SDL_GL_GetDrawableSize(sdl_win, &winWidth, &winHeight);
     printf("window %dx%d\n", winWidth, winHeight);
 
+    // ANativeWindow_getWidth/getHeight answer out of config (thunks/ndk/ndk.cpp),
+    // so if the real drawable differs from what the config asked for -- a
+    // compositor forcing fullscreen, say -- the engine lays out and hit-tests
+    // against the wrong size and every touch lands in the wrong place. Publish
+    // the size we actually got.
+    if (auto *dev = config["device"].as_table())
+    {
+        dev->insert_or_assign("displayWidth", winWidth);
+        dev->insert_or_assign("displayHeight", winHeight);
+    }
+
     // A real (non-NULL) ANativeWindow. eglCreateWindowSurface_impl ignores its
     // contents and hands back the SDL surface, but the engine null-checks the
     // pointer and reads width/height off it.
@@ -545,6 +564,63 @@ int main(int argc, char *argv[])
                 break;
             }
 
+            // ---- touch ----
+            //
+            // Limbo is an Android touch title: its menus and title screen are
+            // driven by MotionEvents from a touchscreen source, and the engine
+            // imports the whole AMotionEvent_get{Action,X,Y,PointerCount,
+            // PointerId} family to read them. Gamepad KeyEvents alone are not
+            // enough to get past the front end.
+            //
+            // The mouse stands in for a finger, and a real touch panel is passed
+            // through as-is. Coordinates go out in window pixels, matching what
+            // ANativeWindow_getWidth/getHeight report.
+            case SDL_MOUSEBUTTONDOWN:
+            case SDL_MOUSEBUTTONUP:
+            {
+                if (ev.button.button != SDL_BUTTON_LEFT)
+                    break;
+                const bool down = (ev.type == SDL_MOUSEBUTTONDOWN);
+                mouse_down = down;
+                int ww = 1, wh = 1;
+                SDL_GetWindowSize(sdl_win, &ww, &wh);
+                AInputQueue_pushMotionEvent(inputQueue, LIMBO_DEVICE_MOUSE,
+                    AINPUT_SOURCE_TOUCHSCREEN,
+                    down ? AMOTION_EVENT_ACTION_DOWN : AMOTION_EVENT_ACTION_UP,
+                    (float)ev.button.x / (float)ww * (float)winWidth,
+                    (float)ev.button.y / (float)wh * (float)winHeight);
+                break;
+            }
+
+            case SDL_MOUSEMOTION:
+            {
+                if (!mouse_down)
+                    break;    // a touchscreen only reports movement while held
+                int ww = 1, wh = 1;
+                SDL_GetWindowSize(sdl_win, &ww, &wh);
+                AInputQueue_pushMotionEvent(inputQueue, LIMBO_DEVICE_MOUSE,
+                    AINPUT_SOURCE_TOUCHSCREEN, AMOTION_EVENT_ACTION_MOVE,
+                    (float)ev.motion.x / (float)ww * (float)winWidth,
+                    (float)ev.motion.y / (float)wh * (float)winHeight);
+                break;
+            }
+
+            case SDL_FINGERDOWN:
+            case SDL_FINGERUP:
+            case SDL_FINGERMOTION:
+            {
+                // SDL normalises finger positions to 0..1 over the window.
+                const int32_t action =
+                    ev.type == SDL_FINGERDOWN ? AMOTION_EVENT_ACTION_DOWN :
+                    ev.type == SDL_FINGERUP   ? AMOTION_EVENT_ACTION_UP :
+                                                AMOTION_EVENT_ACTION_MOVE;
+                AInputQueue_pushMotionEvent(inputQueue, LIMBO_DEVICE_TOUCH,
+                    AINPUT_SOURCE_TOUCHSCREEN, action,
+                    ev.tfinger.x * (float)winWidth,
+                    ev.tfinger.y * (float)winHeight);
+                break;
+            }
+
             default:
                 break;
             }
@@ -553,6 +629,28 @@ int main(int argc, char *argv[])
         const auto now = std::chrono::steady_clock::now();
         const int64_t frameTimeNanos =
             std::chrono::duration_cast<std::chrono::nanoseconds>(now - startTime).count();
+
+        // Re-report the playability / services gates once a second.
+        //
+        // On Android these arrive from Java whenever the licence check and Play
+        // Games sign-in resolve, which is *after* the activity is up -- so the
+        // engine starts waiting for them and is told later. Reporting only once
+        // at startup races that: if the game thread begins waiting after our
+        // single call, the report is lost and it waits forever, which looks
+        // exactly like a stuck title screen with no audio (gameplay never
+        // resumes, so neither does sound). Repeating is safe -- both are
+        // fire-and-forget setters on the engine side.
+        {
+            static int64_t lastGateNs = 0;
+            if (frameTimeNanos - lastGateNs > 1000000000LL)
+            {
+                lastGateNs = frameTimeNanos;
+                if (reportIsPlayable)
+                    reportIsPlayable(env, activityObj, JNI_TRUE);
+                if (reportGameServices)
+                    reportGameServices(env, activityObj, 0);
+            }
+        }
 
         // Stands in for the Choreographer frame callback that drives the game.
         reportVSync(env, activityObj, (jlong)frameTimeNanos);

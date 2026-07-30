@@ -37,15 +37,48 @@ namespace jnivm
                     // it streams from; hand back the cache dir the Context shim
                     // already manages.
                     std::shared_ptr<FakeJni::JString> GetLimboCachedAssetsPath();
+
+                    // ---- gamepad description ----
+                    //
+                    // Limbo does NOT learn about a gamepad from the input events
+                    // themselves. On Android the Java activity inspects the
+                    // InputDevice and publishes its layout into these fields;
+                    // native_DeviceAdded then makes the engine read them back
+                    // (GameController_Android.cpp) and build a GameController.
+                    //
+                    // Until they exist, GetFieldID fails, no controller is built
+                    // and onInputEvent discards everything with "Game controller
+                    // is not present" -- so the pad appears dead even though the
+                    // events are being delivered correctly.
+                    //
+                    // Contents must agree with what the loader actually emits;
+                    // see controller_button_to_keycode / sdl_axis_to_android in
+                    // projects/limboloader/main.cpp.
+                    int gamepadDeviceId = 2;        // == LIMBO_DEVICE_GAMEPAD
+                    int gamepadVendorId = 0x045E;   // Microsoft
+                    int gamepadProductId = 0x028E;  // Xbox 360 pad -- a layout the
+                                                    // engine's controller DB knows
+                    std::shared_ptr<FakeJni::JIntArray> gamepadButtonCodes;
+                    std::shared_ptr<FakeJni::JIntArray> gamepadAxisCodes;
+                    std::shared_ptr<FakeJni::JIntArray> gamepadAxisSources;
+                    std::shared_ptr<FakeJni::JFloatArray> gamepadAxisMinVals;
+                    std::shared_ptr<FakeJni::JFloatArray> gamepadAxisMaxVals;
+
+                    LimboActivity();
                 };
 
                 // Age-gate helper (GDPR/COPPA signals). nativeInit is exported by
                 // libLimbo.so and registers this class's natives; with no Play
                 // Services present the object just has to exist.
+                //
+                // isAgeResolved appears in the binary's string table, so the
+                // engine reads it -- report resolved so a startup gate waiting on
+                // an age check cannot stall.
                 class LimboAgeSignals : public FakeJni::JObject
                 {
                 public:
                     DEFINE_CLASS_NAME("com/playdead/limbo/LimboAgeSignals")
+                    bool isAgeResolved = true;
                 };
             }
         }

@@ -1,5 +1,6 @@
 #include "ainput.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -135,6 +136,12 @@ void AInputQueue_attachLooper(AInputQueue* queue, ALooper* looper, int ident,
     queue->data = data;
 
     ALooper_addFd(looper, queue->read_fd, ident, ALOOPER_EVENT_INPUT, callback, data);
+
+    // Loud on purpose: if this never prints, the guest never wired the queue up
+    // and no amount of pushing events will reach it.
+    printf("[ainput] attachLooper(looper=%p ident=%d callback=%p) fd=%d\n",
+        (void *)looper, ident, (void *)(uintptr_t)callback, queue->read_fd);
+    fflush(stdout);
 }
 
 void AInputQueue_detachLooper(AInputQueue* queue)
@@ -183,6 +190,13 @@ int32_t AInputQueue_getEvent(AInputQueue* queue, AInputEvent** outEvent)
     // Consume the matching wake token so the fd stops signalling once drained.
     uint8_t token;
     (void)!read(queue->read_fd, &token, 1);
+
+    // Confirms the guest is actually draining the queue. Input is low-rate, so
+    // logging every event is cheap and tells us whether delivery or handling is
+    // the problem.
+    printf("[ainput] getEvent -> type=%d device=%d source=0x%x action=%d key=%d\n",
+        e->type, e->deviceId, e->source, e->action, e->keyCode);
+    fflush(stdout);
 
     *outEvent = e;
     return 0;
