@@ -27,6 +27,7 @@
 #include <condition_variable>
 #include <deque>
 #include <vector>
+#include <chrono>
 
 #include <SDL2/SDL.h>
 
@@ -92,28 +93,49 @@ struct Player {
 
     std::deque<Buffer> queue;
     size_t queued_bytes = 0; // unplayed bytes across the whole queue
-    int owed = 0;            // buffers accepted but not yet acknowledged
     std::mutex q_lock;
     std::condition_variable q_cond;
 
     slBufferQueueCallback bq_cb = nullptr;
     void *bq_ctx = nullptr;
 
-    SDL_AudioDeviceID dev = 0; // 0 when no device could be opened
+    SDL_AudioDeviceID dev = 0; // snapshot at creation: 0 if no device backs this player
     float volume = 1.0f;
 
-    // Completion callbacks run on their own thread, never on SDL's audio
-    // thread: the engine decodes the next chunk inside the callback, and
-    // that work must not sit in the device's realtime path.
-    int pending_completions = 0;
-    std::mutex cb_lock;
-    std::condition_variable cb_cond;
+    // Drives bq_cb: never on SDL's audio thread, since the engine decodes
+    // the next chunk inside the callback and that work must not sit in the
+    // device's realtime path. See pump_thread for why this polls on a
+    // steady clock rather than waiting for a downstream-drain signal.
     std::thread cb_thread;
 
     volatile int state = SL_PLAYSTATE_STOPPED;
     volatile bool running = false;
-    std::thread thread; // only used as the no-device fallback pump
+    std::thread thread; // only used as the no-device fallback drain
 };
+
+// The game tears down and rebuilds its *entire* OpenSL engine/output-mix/
+// player triple far more often than once -- observed on nearly every menu
+// transition during actual gameplay, not just at boot. Whether that mirrors
+// real Android's own audio-session pause/resume lifecycle or is a quirk of
+// this engine, the effect on a naive per-Player SDL device is the same: a
+// fresh device opens paused, and if the game destroys this Player again
+// before ever calling SetPlayState(PLAYING) on it, nothing was ever heard.
+//
+// So the real SDL audio device is process-lifetime and shared, independent
+// of how many logical Player objects come and go. A new Player only opens
+// (or reopens, if the format actually changed) the device on demand; it
+// becomes "the" audio source the moment it's told to play, and destroying a
+// Player just detaches it if it was the active one -- the physical device
+// stays open and ready for whatever Player replaces it next. This assumes
+// only one Player is ever meant to be audible at a time, which matches what
+// is actually observed here: exactly one engine/mix/player cycle at a time,
+// never several overlapping (this engine mixes its own voices internally
+// and hands the platform exactly one composited PCM stream, same as most
+// licensed audio middlewares' OpenSL ES backends).
+static std::mutex g_dev_lock;
+static SDL_AudioDeviceID g_dev = 0;
+static int g_dev_rate = 0, g_dev_channels = 0, g_dev_bits = 0;
+static Player *g_active_player = nullptr;
 
 // each interface pointer the game holds is a pointer to one of these slots;
 // GetInterface returns the slot address so (*itf)->Method(itf, ...) dispatches
@@ -132,105 +154,99 @@ static Itf *itf_new(const void *vtbl, Player *p)
 
 #define SELF(itf) (((Itf *)(itf))->self)
 
-// The engine hands over ~1024-byte chunks and keeps only one in flight: it
-// enqueues, waits for the completion, then enqueues the next. Acknowledging a
-// buffer only once the device had played it therefore left at most 5 ms
-// queued, while SDL asks for 21 ms per callback -- three quarters of every
-// callback came out as silence.
-//
-// A buffer is copied on Enqueue, so it can be acknowledged as soon as that
-// copy is made rather than when it is played. The engine then runs ahead and
-// builds a backlog. HIGH_WATER bounds how far, which keeps the engine's
-// audio-paced logic honest and stops the queue growing without limit.
-static const size_t HIGH_WATER = 48000 * 2 * 2 / 10; // ~100 ms of stereo s16
-
-// Call with q_lock held. Returns how many completions may now be signalled.
-static int take_releases_locked(Player *p)
-{
-    int n = 0;
-    while (p->owed > 0 && p->queued_bytes <= HIGH_WATER)
-    {
-        p->owed--;
-        n++;
-    }
-    return n;
-}
-
-// Signal completions. Must NOT be called with q_lock held -- the engine
-// enqueues from inside its callback, which takes q_lock again.
-static void signal_completions(Player *p, int n)
-{
-    if (n <= 0)
-        return;
-    {
-        std::lock_guard<std::mutex> lock(p->cb_lock);
-        p->pending_completions += n;
-    }
-    p->cb_cond.notify_one();
-}
-
 // --- SDL audio device: drains the buffer queue into the sound card ---
 
 static void audio_callback(void *userdata, Uint8 *stream, int len)
 {
-    Player *p = (Player *)userdata;
+    (void)userdata; // the device is shared -- see g_active_player, not a fixed Player
     SDL_memset(stream, 0, len); // silence wherever the queue runs dry
 
-    int release = 0;
+    Player *p;
     {
-        std::lock_guard<std::mutex> lock(p->q_lock);
-        if (p->state == SL_PLAYSTATE_PLAYING)
-        {
-            int off = 0;
-            while (off < len && !p->queue.empty())
-            {
-                Buffer &b = p->queue.front();
-                const size_t avail = b.data.size() - b.pos;
-                const size_t want = (size_t)(len - off);
-                const size_t take = avail < want ? avail : want;
-
-                memcpy(stream + off, b.data.data() + b.pos, take);
-                b.pos += take;
-                off += (int)take;
-                p->queued_bytes -= take;
-
-                if (b.pos >= b.data.size())
-                    p->queue.pop_front();
-            }
-        }
-        // playing frees space, which may let throttled buffers be released
-        release = take_releases_locked(p);
+        std::lock_guard<std::mutex> lock(g_dev_lock);
+        p = g_active_player;
     }
-    signal_completions(p, release);
+    if (!p)
+        return;
+
+    std::lock_guard<std::mutex> lock(p->q_lock);
+    if (p->state == SL_PLAYSTATE_PLAYING)
+    {
+        int off = 0;
+        while (off < len && !p->queue.empty())
+        {
+            Buffer &b = p->queue.front();
+            const size_t avail = b.data.size() - b.pos;
+            const size_t want = (size_t)(len - off);
+            const size_t take = avail < want ? avail : want;
+
+            memcpy(stream + off, b.data.data() + b.pos, take);
+            b.pos += take;
+            off += (int)take;
+            p->queued_bytes -= take;
+
+            if (b.pos >= b.data.size())
+                p->queue.pop_front();
+        }
+    }
 }
 
-// Runs the engine's buffer-completion callbacks off the audio thread. This is
-// also where the next Enqueue happens (the engine calls it from inside the
-// callback), so it must not hold q_lock.
-static void completion_thread(Player *p)
+// Reference: a confirmed-working Wwise-over-OpenSL-ES-over-SDL port (Sonic,
+// see conversation/commit context) drives its buffer queue from a dedicated
+// thread that actively calls the game's registered callback on a steady
+// ~4ms clock whenever buffered content drops below a target, independent of
+// whatever the SDL/downstream side happens to be draining. That is what real
+// Android's OpenSL ES does too: the platform calls the buffer-queue callback
+// on its own hardware-clocked cadence, not reactively once the app's own
+// consumer drains something.
+//
+// Our previous design only ever asked for more data *reactively*, gated by
+// our own downstream queue crossing a byte watermark (HIGH_WATER) -- which,
+// against this specific engine, essentially never asked for data often or
+// regularly enough for its own mixer/decode step to get ahead of real-time.
+// That produced exactly the symptom traced at length: the engine's ring
+// buffer never accumulated real samples, and every callback found on the
+// engine's internal mixer paused (a debugger breakpoint, or a large enough
+// sleep) happened to buy it the wall-clock time it needed. Actively pumping
+// removes the need for any of that: the callback is now invoked frequently
+// and predictably enough that the mixer has a real, steady opportunity to
+// produce ahead of playback, the same as it would on real hardware.
+static void pump_thread(Player *p)
 {
     while (p->running)
     {
-        int n = 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+        if (!p->running)
+            return;
+        if (p->state != SL_PLAYSTATE_PLAYING || !p->bq_cb)
+            continue;
+
+        const size_t bytes_per_sec = (size_t)p->channels * p->rate * (p->bits / 8);
+        const size_t refill_target = bytes_per_sec / 10; // ~100 ms buffered ahead
+
+        // Each call typically gets one small chunk enqueued (this engine's
+        // chunks were observed at ~256 bytes), so filling a real target from
+        // empty can take many calls -- cap generously rather than tightly,
+        // matching the reference's "call repeatedly until topped up" shape
+        // rather than its exact per-tick call count (tuned for a different
+        // engine's much larger chunk size).
+        for (int calls = 0; calls < 64 && p->running; calls++)
         {
-            std::unique_lock<std::mutex> lock(p->cb_lock);
-            p->cb_cond.wait(lock, [&] { return !p->running || p->pending_completions > 0; });
-            if (!p->running)
-                return;
-            n = p->pending_completions;
-            p->pending_completions = 0;
-        }
-        for (int i = 0; i < n && p->running; i++)
-        {
-            if (p->bq_cb)
-                p->bq_cb((void *)p->bqItf, p->bq_ctx);
+            size_t queued;
+            {
+                std::lock_guard<std::mutex> lock(p->q_lock);
+                queued = p->queued_bytes;
+            }
+            if (queued >= refill_target)
+                break;
+            p->bq_cb((void *)p->bqItf, p->bq_ctx);
         }
     }
 }
 
-// Fallback when no audio device could be opened: retire buffers on a timer so
-// the engine's audio pump keeps turning and the game does not stall waiting
-// for completions that would never come.
+// Fallback when no audio device could be opened: drain buffers on a timer so
+// the queue does not grow without bound while pump_thread keeps soliciting
+// more data. Nothing is audible on this path regardless.
 static void fallback_thread(Player *p)
 {
     while (p->running)
@@ -247,18 +263,7 @@ static void fallback_thread(Player *p)
         const Buffer &front = p->queue.front();
         const size_t size = front.data.size();
         p->queued_bytes -= (size - front.pos);
-        if (p->owed > 0)
-            p->owed--;
         p->queue.pop_front();
-        lock.unlock();
-
-        // pace roughly like real playback would
-        const int bytes_per_sec = p->channels * p->rate * (p->bits / 8);
-        const int ms = bytes_per_sec > 0 ? (int)((int64_t)size * 1000 / bytes_per_sec) : 5;
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms > 0 ? ms : 1));
-
-        if (p->bq_cb)
-            p->bq_cb((void *)p->bqItf, p->bq_ctx);
     }
 }
 
@@ -270,21 +275,69 @@ static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size)
     if (!pBuffer || size == 0)
         return SL_RESULT_PARAMETER_INVALID;
 
-    int release = 0;
+    // Rate-print rather than per-call: buffers arrive every few ms during
+    // real playback and per-call logging would either flood or (capped)
+    // stop telling us anything after the first burst. Also track whether
+    // the data itself is non-silent, to rule out the game feeding valid-
+    // looking but all-zero buffers (e.g. a missing decoder upstream).
+    {
+        static size_t bytes_since = 0, silent_bytes_since = 0;
+        static auto last_print = std::chrono::steady_clock::now();
+        static auto last_dump = std::chrono::steady_clock::time_point{};
+        bool all_zero = true;
+        for (SLuint32 i = 0; i < size; i++)
+        {
+            if (((const uint8_t *)pBuffer)[i] != 0) { all_zero = false; break; }
+        }
+        bytes_since += size;
+        if (all_zero)
+            silent_bytes_since += size;
+        auto now = std::chrono::steady_clock::now();
+
+        // Whenever real (non-zero) content shows up, dump it -- rate-limited
+        // since a real stream would otherwise flood this every callback.
+        // Printed as signed 16-bit samples (matches the negotiated format)
+        // plus a peak-amplitude stat: plausible PCM has a peak well above 0
+        // and below the full-scale ~32767; near-zero peak on "non-silent"
+        // data would mean sub-audible noise, not real audio.
+        if (!all_zero && now - last_dump >= std::chrono::seconds(2))
+        {
+            last_dump = now;
+            const int16_t *samples = (const int16_t *)pBuffer;
+            SLuint32 nsamples = size / 2;
+            int16_t peak = 0;
+            for (SLuint32 i = 0; i < nsamples; i++)
+            {
+                int16_t v = samples[i];
+                if (v < 0) v = -v;
+                if (v > peak) peak = v;
+            }
+            printf("opensl: NON-SILENT buffer! size=%u peak_sample=%d first16=", size, peak);
+            for (SLuint32 i = 0; i < 16 && i < nsamples; i++)
+                printf("%d,", samples[i]);
+            printf("\n");
+        }
+
+        if (now - last_print >= std::chrono::seconds(1))
+        {
+            printf("opensl: Enqueue rate: %zu bytes/s (%zu silent) player=%p state=%d is_active=%d\n",
+                bytes_since, silent_bytes_since, (void *)p, p->state, g_active_player == p);
+            bytes_since = 0;
+            silent_bytes_since = 0;
+            last_print = now;
+        }
+    }
+
+    // No acknowledgment bookkeeping here anymore: pump_thread is the sole
+    // driver of bq_cb calls now (see its comment), so Enqueue just has to
+    // store the data.
     {
         std::lock_guard<std::mutex> lock(p->q_lock);
         Buffer b;
         b.data.assign((const uint8_t *)pBuffer, (const uint8_t *)pBuffer + size);
         p->queue.push_back(std::move(b));
         p->queued_bytes += size;
-        p->owed++;
-        // With a device attached the copy is enough to hand the buffer back.
-        // The fallback pump has no device, so it acknowledges on its own
-        // schedule instead and must not double-count here.
-        if (p->dev)
-            release = take_releases_locked(p);
     }
-    signal_completions(p, release);
     p->q_cond.notify_one();
     return SL_RESULT_SUCCESS;
 }
@@ -292,16 +345,9 @@ static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size)
 static SLresult bq_Clear(void *self)
 {
     Player *p = SELF(self);
-    int release = 0;
-    {
-        std::lock_guard<std::mutex> lock(p->q_lock);
-        p->queue.clear();
-        p->queued_bytes = 0;
-        // dropping the backlog frees the whole window, so anything still
-        // owed can be handed back rather than stranding the engine
-        release = take_releases_locked(p);
-    }
-    signal_completions(p, release);
+    std::lock_guard<std::mutex> lock(p->q_lock);
+    p->queue.clear();
+    p->queued_bytes = 0;
     return SL_RESULT_SUCCESS;
 }
 
@@ -339,8 +385,23 @@ static SLresult play_SetPlayState(void *self, SLuint32 state)
 {
     Player *p = SELF(self);
     p->state = state;
-    if (p->dev)
-        SDL_PauseAudioDevice(p->dev, state == SL_PLAYSTATE_PLAYING ? 0 : 1);
+    printf("opensl: SetPlayState player=%p state=%u (1=stopped,2=paused,3=playing)\n", (void *)p, (unsigned)state);
+
+    // Becoming the audible source (or stepping down from it) is decided here,
+    // against the one shared device -- see the comment above g_dev.
+    {
+        std::lock_guard<std::mutex> lock(g_dev_lock);
+        if (state == SL_PLAYSTATE_PLAYING)
+        {
+            g_active_player = p;
+            if (g_dev)
+                SDL_PauseAudioDevice(g_dev, 0);
+        }
+        else if (g_active_player == p && g_dev)
+        {
+            SDL_PauseAudioDevice(g_dev, 1);
+        }
+    }
     if (state == SL_PLAYSTATE_PLAYING)
         p->q_cond.notify_one();
     return SL_RESULT_SUCCESS;
@@ -498,17 +559,23 @@ static void obj_Destroy(void *self)
     if (o->kind == OBJ_PLAYER && o->player)
     {
         Player *p = o->player;
-        // Close the device first: the callback runs on SDL's audio thread and
-        // dereferences this Player, so it has to be stopped before anything
-        // here is torn down.
-        if (p->dev)
+        // Detach from the shared device rather than closing it (see the
+        // comment above g_dev): the next Player created may reuse it
+        // directly. SDL_LockAudioDevice blocks until the callback -- which
+        // may be mid-read of g_active_player right now -- isn't running, so
+        // clearing the pointer here can't race a callback invocation that
+        // already grabbed the old p.
         {
-            SDL_CloseAudioDevice(p->dev);
-            p->dev = 0;
+            std::lock_guard<std::mutex> lock(g_dev_lock);
+            if (g_dev)
+                SDL_LockAudioDevice(g_dev);
+            if (g_active_player == p)
+                g_active_player = nullptr;
+            if (g_dev)
+                SDL_UnlockAudioDevice(g_dev);
         }
         p->running = false;
         p->q_cond.notify_one();
-        p->cb_cond.notify_one();
         if (p->thread.joinable())
             p->thread.join();
         if (p->cb_thread.joinable())
@@ -562,32 +629,65 @@ static SLresult eng_CreateAudioPlayer(void *self, void **pPlayer, SLDataSource *
     p->volItf = itf_new(vol_vtbl, p);
     p->cfgItf = itf_new(cfg_vtbl, p);
 
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
-        printf("opensl: SDL audio init failed: %s\n", SDL_GetError());
+    // Reuse the shared device (see the comment above g_dev) unless it does
+    // not exist yet or the game asked for a genuinely different format.
+    {
+        std::lock_guard<std::mutex> lock(g_dev_lock);
+        bool need_open = (g_dev == 0 || g_dev_rate != p->rate ||
+                          g_dev_channels != p->channels || g_dev_bits != p->bits);
+        if (need_open)
+        {
+            if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0)
+                printf("opensl: SDL audio init failed: %s\n", SDL_GetError());
 
-    SDL_AudioSpec want = {}, have = {};
-    want.freq = p->rate;
-    want.format = p->bits == 8 ? AUDIO_U8 : AUDIO_S16SYS;
-    want.channels = (Uint8)p->channels;
-    want.samples = 1024; // ~21 ms at 48 kHz
-    want.callback = audio_callback;
-    want.userdata = p;
+            SDL_AudioSpec want = {}, have = {};
+            want.freq = p->rate;
+            want.format = p->bits == 8 ? AUDIO_U8 : AUDIO_S16SYS;
+            want.channels = (Uint8)p->channels;
+            want.samples = 1024; // ~21 ms at 48 kHz
+            want.callback = audio_callback;
+            want.userdata = nullptr; // shared device -- see g_active_player
 
-    // No format conversion: the engine's buffers must land in the device
-    // exactly as queued, so ask SDL to match rather than resample.
-    p->dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+            if (g_dev)
+            {
+                SDL_CloseAudioDevice(g_dev);
+                g_dev = 0;
+                g_active_player = nullptr;
+            }
+
+            // No format conversion: the engine's buffers must land in the
+            // device exactly as queued, so ask SDL to match rather than resample.
+            g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+            if (g_dev)
+            {
+                g_dev_rate = p->rate;
+                g_dev_channels = p->channels;
+                g_dev_bits = p->bits;
+                printf("opensl: opened shared device: %d Hz, %d ch, %d-bit -- SDL driver=%s, "
+                    "negotiated freq=%d format=0x%x channels=%d samples=%d\n",
+                    p->rate, p->channels, p->bits, SDL_GetCurrentAudioDriver(),
+                    have.freq, have.format, have.channels, have.samples);
+            }
+            else
+            {
+                printf("opensl: no audio device (%s) -- running silent\n", SDL_GetError());
+            }
+        }
+        else
+        {
+            printf("opensl: reusing shared device for new player (%d Hz, %d ch, %d-bit)\n",
+                p->rate, p->channels, p->bits);
+        }
+        p->dev = g_dev;
+    }
 
     p->running = true;
-    if (p->dev)
-    {
-        printf("opensl: %d Hz, %d ch, %d-bit\n", p->rate, p->channels, p->bits);
-        p->cb_thread = std::thread(completion_thread, p);
-    }
-    else
-    {
-        printf("opensl: no audio device (%s) -- running silent\n", SDL_GetError());
+    // pump_thread solicits data regardless of whether a real device backs
+    // this player; fallback_thread additionally drains the queue when there
+    // is no real device to do that via audio_callback.
+    p->cb_thread = std::thread(pump_thread, p);
+    if (!p->dev)
         p->thread = std::thread(fallback_thread, p);
-    }
 
     Object *o = (Object *)calloc(1, sizeof(*o));
     o->objVtbl = obj_vtbl;

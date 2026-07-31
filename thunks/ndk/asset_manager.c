@@ -66,7 +66,7 @@ AAssetManager* AAssetManager_fromJava(void* env, void* obj) {
 AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
     char* full_path = get_full_path(mgr, filename);
     struct stat st;
-    
+
     if(stat(full_path, &st) < 0) {
         free(full_path);
         return NULL;

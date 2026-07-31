@@ -6,12 +6,14 @@ build/
 build_release/
 build_cross/
 build_2004/
+build_limbo/
 libjnivm/build/
 il2cpp/
 projects/unityloader/monocompat/il2cpp_log_shim.cpp
 dist/apk_lt1reu/split_InstallAssets.apk
 dist/apk_lt1reu/split_config.arm64_v8a.apk
 dist/apk_lt1reu/base.apk
+androguard.db
 
 # vendored build output (rebuild with projects/*/tools/*.sh)
 projects/*/third_party/

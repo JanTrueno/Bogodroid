@@ -1,6 +1,66 @@
 #include "baron/baron.h"
 #include "limbo.h"
 #include "ainput.h"
+#include <cstdio>
+#include <cstring>
+#include <climits>
+
+// Set by config.cpp right after chdir() into the game's own directory (see
+// the comment on this same declaration in thunks/ndk/asset_manager.c) -- used
+// here so the save-state file lands next to the loader rather than wherever
+// the process's cwd happens to be when a SaveGame_Set* call comes in.
+extern "C" char g_loader_root[];
+
+static void SaveState_Path(char *out, size_t out_sz)
+{
+    if (g_loader_root[0] != '\0')
+        snprintf(out, out_sz, "%s/limbo_savegame_state.txt", g_loader_root);
+    else
+        snprintf(out, out_sz, "limbo_savegame_state.txt");
+}
+
+void jnivm::com::playdead::limbo::LimboActivity::SaveState_Load()
+{
+    char path[PATH_MAX];
+    SaveState_Path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return;
+
+    int autoResumeInt = 0;
+    char key[64];
+    int value;
+    while (fscanf(f, "%63[^=]=%d\n", key, &value) == 2)
+    {
+        if (!strcmp(key, "lastSavePoint")) lastSavePoint = value;
+        else if (!strcmp(key, "savePointReached")) savePointReached = value;
+        else if (!strcmp(key, "achievementBitfield")) achievementBitfield = value;
+        else if (!strcmp(key, "autoResume")) autoResumeInt = value;
+    }
+    autoResume = autoResumeInt != 0;
+    fclose(f);
+
+    printf("[limbo] loaded persisted save state from %s: lastSavePoint=%d savePointReached=%d "
+        "achievementBitfield=%d autoResume=%d\n",
+        path, lastSavePoint, savePointReached, achievementBitfield, autoResume);
+}
+
+void jnivm::com::playdead::limbo::LimboActivity::SaveState_Save()
+{
+    char path[PATH_MAX];
+    SaveState_Path(path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f)
+    {
+        printf("[limbo] failed to persist save state to %s\n", path);
+        return;
+    }
+    fprintf(f, "lastSavePoint=%d\n", lastSavePoint);
+    fprintf(f, "savePointReached=%d\n", savePointReached);
+    fprintf(f, "achievementBitfield=%d\n", achievementBitfield);
+    fprintf(f, "autoResume=%d\n", autoResume ? 1 : 0);
+    fclose(f);
+}
 
 std::shared_ptr<FakeJni::JString> jnivm::com::playdead::limbo::LimboActivity::GetLimboCachedAssetsPath()
 {
@@ -72,6 +132,52 @@ jnivm::com::playdead::limbo::LimboActivity::LimboActivity()
         (*gamepadAxisMinVals)[i] = axes[i].min;
         (*gamepadAxisMaxVals)[i] = axes[i].max;
     }
+
+    SaveState_Load();
+}
+
+void jnivm::com::playdead::limbo::LimboActivity::SaveGame_SetLastSavePoint(int value)
+{
+    lastSavePoint = value;
+    SaveState_Save();
+}
+
+int jnivm::com::playdead::limbo::LimboActivity::SaveGame_GetLastSavePoint()
+{
+    return lastSavePoint;
+}
+
+void jnivm::com::playdead::limbo::LimboActivity::SaveGame_SetSavePointReached(int value)
+{
+    savePointReached = value;
+    SaveState_Save();
+}
+
+int jnivm::com::playdead::limbo::LimboActivity::SaveGame_GetSavePointReached()
+{
+    return savePointReached;
+}
+
+void jnivm::com::playdead::limbo::LimboActivity::SaveGame_SetAchievementBitfield(int value)
+{
+    achievementBitfield = value;
+    SaveState_Save();
+}
+
+int jnivm::com::playdead::limbo::LimboActivity::SaveGame_GetAchievementBitfield()
+{
+    return achievementBitfield;
+}
+
+void jnivm::com::playdead::limbo::LimboActivity::SaveGame_SetAutoResume(bool value)
+{
+    autoResume = value;
+    SaveState_Save();
+}
+
+bool jnivm::com::playdead::limbo::LimboActivity::SaveGame_GetAutoResume()
+{
+    return autoResume;
 }
 
 BEGIN_NATIVE_DESCRIPTOR(jnivm::com::playdead::limbo::LimboActivity)
@@ -85,6 +191,14 @@ BEGIN_NATIVE_DESCRIPTOR(jnivm::com::playdead::limbo::LimboActivity)
 { FakeJni::Field<&LimboActivity::gamepadAxisSources> {}, "gamepadAxisSources", FakeJni::JFieldID::PUBLIC },
 { FakeJni::Field<&LimboActivity::gamepadAxisMinVals> {}, "gamepadAxisMinVals", FakeJni::JFieldID::PUBLIC },
 { FakeJni::Field<&LimboActivity::gamepadAxisMaxVals> {}, "gamepadAxisMaxVals", FakeJni::JFieldID::PUBLIC },
+{ FakeJni::Function<&LimboActivity::SaveGame_SetLastSavePoint> {}, "SaveGame_SetLastSavePoint", FakeJni::JMethodID::PUBLIC },
+{ FakeJni::Function<&LimboActivity::SaveGame_GetLastSavePoint> {}, "SaveGame_GetLastSavePoint", FakeJni::JMethodID::PUBLIC },
+{ FakeJni::Function<&LimboActivity::SaveGame_SetSavePointReached> {}, "SaveGame_SetSavePointReached", FakeJni::JMethodID::PUBLIC },
+{ FakeJni::Function<&LimboActivity::SaveGame_GetSavePointReached> {}, "SaveGame_GetSavePointReached", FakeJni::JMethodID::PUBLIC },
+{ FakeJni::Function<&LimboActivity::SaveGame_SetAchievementBitfield> {}, "SaveGame_SetAchievementBitfield", FakeJni::JMethodID::PUBLIC },
+{ FakeJni::Function<&LimboActivity::SaveGame_GetAchievementBitfield> {}, "SaveGame_GetAchievementBitfield", FakeJni::JMethodID::PUBLIC },
+{ FakeJni::Function<&LimboActivity::SaveGame_SetAutoResume> {}, "SaveGame_SetAutoResume", FakeJni::JMethodID::PUBLIC },
+{ FakeJni::Function<&LimboActivity::SaveGame_GetAutoResume> {}, "SaveGame_GetAutoResume", FakeJni::JMethodID::PUBLIC },
 END_NATIVE_DESCRIPTOR
 
 // Report resolved so any engine code that calls this through the method id

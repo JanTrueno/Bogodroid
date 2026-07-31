@@ -906,10 +906,28 @@ public:
     class InputDeviceListener : public virtual FakeJni::JObject {
     public:
         DEFINE_CLASS_NAME("android/hardware/input/InputManager$InputDeviceListener")
+        // Virtual (not pure -- this class is directly constructible via its
+        // own FakeJni::Constructor entry below): a bytecode-loaded subclass
+        // overrides these, and calling them from C++ dispatches to that
+        // override, same idea as Runnable::run(). Real games (Limbo included)
+        // implement all three and use onInputDeviceAdded to decide whether a
+        // controller is actually present -- registerInputDeviceListener used
+        // to be a no-op, so this never fired and the check always saw "no
+        // controller".
+        virtual void onInputDeviceAdded(int deviceId) {}
+        virtual void onInputDeviceRemoved(int deviceId) {}
+        virtual void onInputDeviceChanged(int deviceId) {}
     };
     std::shared_ptr<jnivm::Array<int>> getInputDeviceIds();
     std::shared_ptr<jnivm::android::view::InputDevice> getInputDevice(int device);
     void registerInputDeviceListener(std::shared_ptr<jnivm::android::hardware::input::InputManager::InputDeviceListener> listener, std::shared_ptr<jnivm::android::os::Handler> handler);
+
+    // Loader-side trigger: call once InputBackend's device registry actually
+    // has the device in question, so the listener's own device scan (this is
+    // what Limbo's onInputDeviceAdded handler does) finds it.
+    static void NotifyDeviceAdded(int deviceId);
+    static void NotifyDeviceRemoved(int deviceId);
+    static void NotifyDeviceChanged(int deviceId);
 };
 }
 #endif

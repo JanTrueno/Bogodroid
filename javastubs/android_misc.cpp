@@ -36,8 +36,34 @@ std::shared_ptr<jnivm::Array<int>> jnivm::android::hardware::input::InputManager
     return jnivm::android::view::InputDevice::getDeviceIds();
 }
 
+// This used to be a no-op -- it never stored the listener, so nothing ever
+// called it. Real games register exactly one of these (to learn about
+// controllers connecting/disconnecting at runtime), so a single static slot
+// is enough; last-registered-wins matches real InputManager's behavior for
+// the common case of only ever having one listener anyway.
+static std::shared_ptr<jnivm::android::hardware::input::InputManager::InputDeviceListener> g_inputDeviceListener;
+
 void jnivm::android::hardware::input::InputManager::registerInputDeviceListener(std::shared_ptr<InputDeviceListener> listener, std::shared_ptr<jnivm::android::os::Handler> handler)
 {
+    g_inputDeviceListener = listener;
+}
+
+void jnivm::android::hardware::input::InputManager::NotifyDeviceAdded(int deviceId)
+{
+    if (g_inputDeviceListener)
+        g_inputDeviceListener->onInputDeviceAdded(deviceId);
+}
+
+void jnivm::android::hardware::input::InputManager::NotifyDeviceRemoved(int deviceId)
+{
+    if (g_inputDeviceListener)
+        g_inputDeviceListener->onInputDeviceRemoved(deviceId);
+}
+
+void jnivm::android::hardware::input::InputManager::NotifyDeviceChanged(int deviceId)
+{
+    if (g_inputDeviceListener)
+        g_inputDeviceListener->onInputDeviceChanged(deviceId);
 }
 
 ///// Activity

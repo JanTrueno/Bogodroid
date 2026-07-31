@@ -64,6 +64,40 @@ namespace jnivm
                     std::shared_ptr<FakeJni::JFloatArray> gamepadAxisMinVals;
                     std::shared_ptr<FakeJni::JFloatArray> gamepadAxisMaxVals;
 
+                    // ---- save game state ----
+                    //
+                    // On real Android, these Set/Get pairs are how the native
+                    // engine hands its in-level checkpoint bookkeeping off to
+                    // Java (which is expected to persist it) and reads it back
+                    // (e.g. to decide what to reload on death). These stubs
+                    // used to not exist at all, so every Set* was silently
+                    // discarded and every Get* read back its C++ default (0 /
+                    // false) -- e.g. after reaching checkpoint 22, dying asked
+                    // to "Load from Save index: 0" instead of 22, which the
+                    // engine has no fallback for (unlike named checkpoint IDs
+                    // >= 10) and starts an unrecoverable "does not exist" loop.
+                    // Persisted to a real file (see SaveState_Load/Save in
+                    // limbo.cpp) so progress survives closing and reopening
+                    // the loader, not just death within one session.
+                    void SaveGame_SetLastSavePoint(int value);
+                    int SaveGame_GetLastSavePoint();
+                    void SaveGame_SetSavePointReached(int value);
+                    int SaveGame_GetSavePointReached();
+                    void SaveGame_SetAchievementBitfield(int value);
+                    int SaveGame_GetAchievementBitfield();
+                    void SaveGame_SetAutoResume(bool value);
+                    bool SaveGame_GetAutoResume();
+
+                private:
+                    int lastSavePoint = 0;
+                    int savePointReached = 0;
+                    int achievementBitfield = 0;
+                    bool autoResume = false;
+
+                    void SaveState_Load();
+                    void SaveState_Save();
+
+                public:
                     LimboActivity();
                 };
 

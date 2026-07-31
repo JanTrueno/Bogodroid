@@ -7,6 +7,16 @@
 #include <iostream>
 #include <fstream>
 
+void ensure_parent_dirs(const char *path)
+{
+  std::filesystem::path p(path);
+  std::filesystem::path parent = p.parent_path();
+  if (parent.empty())
+    return;
+  std::error_code ec; // don't throw -- a bad/relative path here just means the open call fails normally
+  std::filesystem::create_directories(parent, ec);
+}
+
 bool load_so_from_file(so_module *mod, const char *filename, uintptr_t addr)
 {
   std::ifstream file(filename, std::ios::binary);

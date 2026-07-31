@@ -46,6 +46,7 @@ toml::table config;
 #include <baron/baron.h>
 #include "javastubs/binding.h"
 #include "javastubs/limbo.h"
+#include "input_backend.h"
 
 #include "platform.h"
 #include "so_util.h"
@@ -72,6 +73,8 @@ extern DynLibFunction symtable_libc[];
 extern DynLibFunction symtable_ndk[];
 extern DynLibFunction symtable_gles2[];
 extern DynLibFunction symtable_egl_sdl[];
+extern DynLibFunction symtable_limbo_gl[];
+extern DynLibFunction symtable_limbo_assets[];
 
 extern SDL_Window *sdl_win;
 
@@ -81,7 +84,14 @@ DynLibFunction *so_static_patches[32] = {
 
 DynLibFunction *so_dynamic_libraries[32] = {
     symtable_libc,
+    // must precede symtable_ndk: resolution takes the first match, and this
+    // overrides AAssetManager_fromJava for Limbo's own chdir behavior (see
+    // asset_manager_override.cpp)
+    symtable_limbo_assets,
     symtable_ndk,
+    // must precede symtable_gles2: resolution takes the first match, and these
+    // bind the GL context on Limbo's render thread (see gl_thread_bind.cpp)
+    symtable_limbo_gl,
     symtable_gles2,
     symtable_egl_sdl,
     symtable_opensl,
@@ -117,11 +127,6 @@ typedef void (*reportGameServices_t)(JNIEnv *, jobject, jint state);
 #define LIMBO_DEVICE_KEYBOARD 1
 #define LIMBO_DEVICE_GAMEPAD 2
 #define LIMBO_DEVICE_MOUSE 3
-#define LIMBO_DEVICE_TOUCH 4
-
-// Whether the mouse button is held -- a touchscreen only reports ACTION_MOVE
-// between a DOWN and an UP, so hovering must not generate motion.
-static bool mouse_down = false;
 
 // AKEYCODE_* (android/keycodes.h)
 enum {
@@ -241,13 +246,31 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    // Init config (also chdir's into paths.game_files), GLES pointers, JNI VM
+    // Init config (also chdir's into paths.game_files) and the JNI VM.
+    //
+    // GL setup goes through eglGetDisplay_impl rather than sdl_initialize_gles():
+    // both create the window and context, but only the former also captures the
+    // EGL handles the game's EGL calls are answered from. Using
+    // sdl_initialize_gles() here left egl_display unset, so the game's own
+    // InitEGL ran the whole path a second time and replaced the window and
+    // context out from under everything.
+    //
+    // It has to happen before libLimbo is loaded: so_resolve_link() patches
+    // unresolved imports to a crash stub during relocation and never looks
+    // again, so the GLES entry points must exist by then.
     init_config(argv[1]);
-    sdl_initialize_gles();
-    load_gles2_funcs();
+    eglGetDisplay_impl(nullptr);
+
+    // That left the context current on this thread. Limbo renders from its own
+    // "LIMBO game" thread and never calls eglMakeCurrent, so gl_thread_bind.cpp
+    // binds it there on the first GL call -- which fails with EGL_BAD_ACCESS
+    // while another thread still owns it. This thread does no GL of its own
+    // (the game swaps its own buffers), so hand it over.
+    SDL_GL_MakeCurrent(sdl_win, NULL);
+
     InitJNIBinding(&vm);
 
-    // Gamepad support. sdl_initialize_gles() only brings up SDL_INIT_VIDEO.
+    // Gamepad support. SDL video comes up later, inside the game's eglGetDisplay.
     if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0)
         printf("SDL gamecontroller init failed (%s) -- keyboard only\n", SDL_GetError());
 
@@ -266,7 +289,7 @@ int main(int argc, char *argv[])
     // Switch port uses for libchrono.so.
     printf("Loading libc++_shared\n");
     so_module lcpp = {};
-    const char *path_lcpp = "arm64-v8a/libc++_shared.so";
+    const char *path_lcpp = "lib/arm64-v8a/libc++_shared.so";
     if (!load_so_from_file(&lcpp, path_lcpp, 0x40000000))
     {
         printf("Failed to load %s -- libLimbo's std:: imports cannot resolve.\n", path_lcpp);
@@ -276,11 +299,59 @@ int main(int argc, char *argv[])
     printf("Loading libLimbo\n");
     so_module lmain = {};
     uintptr_t addr_lmain = 0x50000000;
-    const char *path_lmain = "arm64-v8a/libLimbo.so";
+    const char *path_lmain = "lib/arm64-v8a/libLimbo.so";
     if (!load_so_from_file(&lmain, path_lmain, addr_lmain))
     {
         printf("Failed to load %s\n", path_lmain);
         return 1;
+    }
+
+    // Remove the engine's hardcoded 1024px backbuffer-width cap.
+    //
+    // Note: this exposes a second, still-unlocated hardcoded-1024 assumption
+    // elsewhere in libLimbo.so -- confirmed by A/B testing at 1024x576 vs
+    // native res -- that corrupts certain scenes (horizontal stripes / black
+    // squares, wedge-shaped toward one edge, consistent with a row-stride
+    // mismatch). Re-enabled here for another look; if the artifact is a
+    // dealbreaker again, comment the byte-patch block below back out.
+    //
+    // CreateWindowToGameBinding (decompiled via Ghidra; real/file address
+    // 0x241cb8, using this project's established Ghidra-VA-minus-0x100000
+    // convention, cross-checked exactly against the real ELF address of
+    // native_ReportVSyncCallEvent) computes its render target from the real
+    // ANativeWindow size, then unconditionally clamps it:
+    //
+    //   iVar11 = <the real display width, computed either directly or via
+    //             an aspect-ratio roundtrip that reduces to the same value>;
+    //   if (0x3ff < iVar11) iVar11 = 0x400;   // hardcoded clamp to 1024
+    //
+    // which is why the game always renders at 1024x576 regardless of the
+    // real screen size, and regardless of anything in assets/settings.txt --
+    // that file's backbufferheight/per-GPU platform table is parsed (see
+    // FUN_0034a84c) but never consulted by this code path at all.
+    //
+    // The clamp compiles to (disassembly, real/file-relative addresses):
+    //   241cac  cmp   w8, #0x400
+    //   241cb0  mov   w9, #0x400
+    //   241cb8  csel  w20, w8, w9, lt   ; w20 = (w8 < 0x400) ? w8 : w9
+    //
+    // Flipping the csel's condition nibble from LT (0xb) to AL (0xe) makes
+    // it always select w8 -- the pre-clamp value, i.e. the real display
+    // width -- with no hardcoded replacement number of our own, so it keeps
+    // tracking whatever size we report via config/ANativeWindow forever.
+    //
+    uint8_t *csel_cond_byte = (uint8_t *)(lmain.base + 0x241cb9);
+    if (*csel_cond_byte == 0xb1)
+    {
+        *csel_cond_byte = 0xe1;
+        __builtin___clear_cache((char *)csel_cond_byte, (char *)csel_cond_byte + 1);
+        printf("[patch] removed libLimbo's hardcoded 1024px backbuffer-width cap\n");
+    }
+    else
+    {
+        printf("[patch] WARNING: backbuffer-cap patch site does not match expected bytes "
+               "(got 0x%02x, expected 0xb1) -- skipping; game will render at a fixed low resolution\n",
+               *csel_cond_byte);
     }
 
     FakeJni::LocalFrame frame(vm);
@@ -391,8 +462,13 @@ int main(int argc, char *argv[])
     // then blocks waiting for a window. Everything below runs on this thread,
     // standing in for Android's UI thread.
 
-    int winWidth = 0, winHeight = 0;
-    SDL_GL_GetDrawableSize(sdl_win, &winWidth, &winHeight);
+    // The window does not exist yet -- the game creates it during InitEGL,
+    // which happens below in onNativeWindowCreated -- so report the configured
+    // size for now and re-read it once it is real.
+    int winWidth = config["device"]["displayWidth"].value_or<int>(1280);
+    int winHeight = config["device"]["displayHeight"].value_or<int>(720);
+    if (sdl_win)
+        SDL_GL_GetDrawableSize(sdl_win, &winWidth, &winHeight);
     printf("window %dx%d\n", winWidth, winHeight);
 
     // ANativeWindow_getWidth/getHeight answer out of config (thunks/ndk/ndk.cpp),
@@ -445,6 +521,11 @@ int main(int argc, char *argv[])
         nActivity.callbacks->onNativeWindowCreated(&nActivity, window);
     }
 
+    // InitEGL runs inside that callback and is what actually creates sdl_win
+    // (see eglGetDisplay_impl); pick up the real size now that it exists.
+    if (sdl_win)
+        SDL_GL_GetDrawableSize(sdl_win, &winWidth, &winHeight);
+
     if (nActivity.callbacks->onWindowFocusChanged)
     {
         printf("calling onWindowFocusChanged(1)\n");
@@ -465,10 +546,33 @@ int main(int argc, char *argv[])
         reportGameServices(env, activityObj, 0);
     }
 
+    // The Java InputManager/InputDevice plumbing below is a real, independent
+    // fix (registerInputDeviceListener used to be a no-op that never stored
+    // the listener, so android.hardware.input.InputManager.InputDeviceListener
+    // could never fire) -- but it turned out NOT to be what gates Limbo's own
+    // touch-vs-press prompt. That check (BoyInput_UsingGameController(),
+    // reverse engineered from the shipped .so) just reads bit 8 of a
+    // per-player flags struct that the engine's own input processing sets the
+    // first time it sees a real gamepad-sourced AKeyEvent/AMotionEvent come
+    // through AInputQueue. ChooseStartLabelBasedOnInputType runs once, right
+    // as the Press Start screen first appears (a second or two into boot) --
+    // long before the player has had any chance to press anything -- so that
+    // bit is still 0 at decision time no matter how correctly later button
+    // presses are reported. See the push_axis_state() call right below: it
+    // exists specifically to get one real gamepad-sourced event processed
+    // before that screen ever asks.
+    InputBackend::instance();
+
     // Announce the input devices the game can expect.
     if (deviceAdded)
     {
         deviceAdded(env, activityObj, LIMBO_DEVICE_KEYBOARD);
+        // Limbo's press-start screen defaults to its touch prompt
+        // (touchStartEntry) rather than the button prompt, and nothing below
+        // ever sent it a touch/pointer event to satisfy that -- SDL_FINGER*/
+        // SDL_MOUSEBUTTON* were never handled at all, so neither a real
+        // touchscreen tap nor a synthesized one ever reached the engine.
+        deviceAdded(env, activityObj, LIMBO_DEVICE_MOUSE);
         for (int i = 0; i < SDL_NumJoysticks(); ++i)
         {
             if (SDL_IsGameController(i))
@@ -476,6 +580,21 @@ int main(int argc, char *argv[])
                 SDL_GameControllerOpen(i);
                 printf("opened game controller: %s\n", SDL_GameControllerNameForIndex(i));
                 deviceAdded(env, activityObj, LIMBO_DEVICE_GAMEPAD);
+                jnivm::android::hardware::input::InputManager::NotifyDeviceAdded(LIMBO_DEVICE_GAMEPAD);
+                // A synthetic axis/motion event here did NOT trigger "setting
+                // current game controller" -- that only ever fires on a real
+                // key press (BOYINPUT_JUMP/UP/LEFT/RIGHT/DOWN/ACTION are all
+                // discrete buttons, not analog motion), so the flag this is
+                // meant to pre-empt is evidently set from key events
+                // specifically. AKEYCODE_BUTTON_SELECT ("back") is not bound
+                // to any real gameplay action, and at this point in startup
+                // no scene/player exists yet to react to it anyway.
+                AInputQueue_pushKeyEvent(inputQueue, LIMBO_DEVICE_GAMEPAD,
+                    AINPUT_SOURCE_GAMEPAD | AINPUT_SOURCE_JOYSTICK,
+                    AKEY_EVENT_ACTION_DOWN, AKEYCODE_BUTTON_SELECT, 0);
+                AInputQueue_pushKeyEvent(inputQueue, LIMBO_DEVICE_GAMEPAD,
+                    AINPUT_SOURCE_GAMEPAD | AINPUT_SOURCE_JOYSTICK,
+                    AKEY_EVENT_ACTION_UP, AKEYCODE_BUTTON_SELECT, 0);
                 break;
             }
         }
@@ -488,6 +607,28 @@ int main(int argc, char *argv[])
     // which is why the game never advanced past its first frame.
     const auto startTime = std::chrono::steady_clock::now();
     bool running = true;
+    // Whether to accept pointer events as touch at all. Decided up front from
+    // whether SDL sees a real touch device, rather than latched on the first
+    // finger event: this panel reports as both, and waiting for a finger left
+    // a window at startup where a stray pointer motion still got forwarded --
+    // the engine saw a MOVE with no preceding DOWN (at a degenerate edge
+    // position) and rejected the touch that followed it.
+    const bool have_touch_device = SDL_GetNumTouchDevices() > 0;
+    printf("touch devices: %d (pointer %s treated as touch)\n",
+        SDL_GetNumTouchDevices(), have_touch_device ? "will NOT be" : "will be");
+    // The one finger being forwarded to the engine, if any.
+    constexpr SDL_FingerID NO_FINGER = -1;
+    SDL_FingerID active_finger = NO_FINGER;
+    // Limbo's own internal backbuffer/touch space, confirmed fixed at 1024x576
+    // regardless of the ANativeWindow size we report (1280x720 -> 1024x576 at
+    // 0.8x, 1920x1080 -> 1024x576 at 0.533x -- always the same target). Touch
+    // coordinates need to land in THIS space, not the reported window size:
+    // scaling by ANativeWindow_getWidth/Height only happened to look right for
+    // taps near the center, since e.g. 0.5 normalized * 1920 ~= 960, still
+    // under 1024 by luck -- a tap further out would compute a value over the
+    // bound the engine actually checks against.
+    constexpr float LIMBO_TOUCH_WIDTH = 1024.0f;
+    constexpr float LIMBO_TOUCH_HEIGHT = 576.0f;
 
     while (running)
     {
@@ -532,6 +673,90 @@ int main(int argc, char *argv[])
                 break;
             }
 
+            // Touch has to be reported in the coordinate space the engine
+            // believes its window to be, which is what ANativeWindow_getWidth/
+            // Height hand it -- the configured displayWidth/Height, NOT the
+            // host window's actual pixel size. Those were the same thing while
+            // the window was a fixed 640x480, but once it goes fullscreen the
+            // drawable is whatever the panel is, and scaling by that put every
+            // touch in the wrong space: the engine applies its own
+            // window->game transform on top (1280x720 -> its 1024x576 touch
+            // bounds, letterboxing included), so the mismatch came back out as
+            // the negative and past-the-bottom coordinates it rejects.
+            case SDL_FINGERDOWN:
+            case SDL_FINGERMOTION:
+            case SDL_FINGERUP:
+            {
+                // Follow one finger at a time. AInputQueue_pushMotionEvent
+                // carries a single pointer (pointerCount 1, pointerId 0), so
+                // every finger was being flattened onto the same pointer id:
+                // a second finger interleaved its own DOWN/MOVE into the
+                // first one's stream, which is what the engine was reporting
+                // as "Began arrived after Move - missing Ended" (the tell was
+                // a MOVE and a DOWN microseconds apart at unrelated
+                // positions). Limbo only needs a single touch point, so track
+                // the first finger down and ignore the rest until it lifts.
+                if (ev.type == SDL_FINGERDOWN)
+                {
+                    if (active_finger != NO_FINGER)
+                    {
+                        printf("finger DOWN ignored: already following finger %lld\n",
+                            (long long)active_finger);
+                        break;              // already following another finger
+                    }
+                    active_finger = ev.tfinger.fingerId;
+                }
+                else if (ev.tfinger.fingerId != active_finger)
+                    break;                  // a finger we are not following
+
+                const int32_t action =
+                    ev.type == SDL_FINGERDOWN ? AMOTION_EVENT_ACTION_DOWN
+                    : ev.type == SDL_FINGERUP ? AMOTION_EVENT_ACTION_UP
+                                              : AMOTION_EVENT_ACTION_MOVE;
+                const float x = ev.tfinger.x * LIMBO_TOUCH_WIDTH;
+                const float y = ev.tfinger.y * LIMBO_TOUCH_HEIGHT;
+                if (ev.type != SDL_FINGERMOTION)
+                    printf("finger %s: raw=(%.3f,%.3f) engine-space=(%.1f,%.1f)\n",
+                        ev.type == SDL_FINGERDOWN ? "DOWN" : "UP",
+                        ev.tfinger.x, ev.tfinger.y, x, y);
+                AInputQueue_pushMotionEvent(inputQueue, LIMBO_DEVICE_MOUSE,
+                    AINPUT_SOURCE_TOUCHSCREEN, action, x, y);
+
+                if (ev.type == SDL_FINGERUP)
+                    active_finger = NO_FINGER;
+                break;
+            }
+
+            // Fallback for touchscreens whose driver surfaces taps as a mouse
+            // rather than through SDL's finger API (common on embedded
+            // kmsdrm/evdev setups without native multitouch support). These
+            // arrive in real window pixels, so normalise before rescaling into
+            // the engine's space the same way finger events are.
+            case SDL_MOUSEBUTTONDOWN:
+            case SDL_MOUSEBUTTONUP:
+                if (!have_touch_device && ev.button.button == SDL_BUTTON_LEFT)
+                {
+                    const float x = (float)ev.button.x / winWidth * LIMBO_TOUCH_WIDTH;
+                    const float y = (float)ev.button.y / winHeight * LIMBO_TOUCH_HEIGHT;
+                    printf("mouse %s: raw=(%d,%d) engine-space=(%.1f,%.1f)\n",
+                        ev.type == SDL_MOUSEBUTTONDOWN ? "DOWN" : "UP",
+                        ev.button.x, ev.button.y, x, y);
+                    AInputQueue_pushMotionEvent(inputQueue, LIMBO_DEVICE_MOUSE,
+                        AINPUT_SOURCE_TOUCHSCREEN,
+                        ev.type == SDL_MOUSEBUTTONDOWN ? AMOTION_EVENT_ACTION_DOWN
+                                                        : AMOTION_EVENT_ACTION_UP,
+                        x, y);
+                }
+                break;
+
+            case SDL_MOUSEMOTION:
+                if (!have_touch_device && (ev.motion.state & SDL_BUTTON_LMASK))
+                    AInputQueue_pushMotionEvent(inputQueue, LIMBO_DEVICE_MOUSE,
+                        AINPUT_SOURCE_TOUCHSCREEN, AMOTION_EVENT_ACTION_MOVE,
+                        (float)ev.motion.x / winWidth * LIMBO_TOUCH_WIDTH,
+                        (float)ev.motion.y / winHeight * LIMBO_TOUCH_HEIGHT);
+                break;
+
             case SDL_CONTROLLERDEVICEADDED:
                 if (SDL_IsGameController(ev.cdevice.which))
                 {
@@ -540,6 +765,7 @@ int main(int argc, char *argv[])
                         SDL_GameControllerNameForIndex(ev.cdevice.which));
                     if (deviceAdded)
                         deviceAdded(env, activityObj, LIMBO_DEVICE_GAMEPAD);
+                    jnivm::android::hardware::input::InputManager::NotifyDeviceAdded(LIMBO_DEVICE_GAMEPAD);
                 }
                 break;
 
@@ -553,10 +779,29 @@ int main(int argc, char *argv[])
             case SDL_CONTROLLERBUTTONUP:
             {
                 const int32_t keyCode = controller_button_to_keycode(ev.cbutton.button);
+                if (ev.type == SDL_CONTROLLERBUTTONDOWN)
+                {
+                    const char *buttonName = SDL_GameControllerGetStringForButton(
+                        (SDL_GameControllerButton)ev.cbutton.button);
+                    printf("controller button pressed: raw=%d (%s) -> keycode=%d%s\n",
+                        ev.cbutton.button, buttonName ? buttonName : "?", keyCode,
+                        keyCode == AKEYCODE_UNKNOWN ? " (unmapped)" : "");
+                    fflush(stdout);
+                }
                 if (keyCode == AKEYCODE_UNKNOWN)
                     break;
+                // Matches push_axis_state below: a real Android gamepad reports
+                // GAMEPAD | JOYSTICK on all of its input, not just its axes.
+                // Limbo's own "am I looking at joystick input?" check (the one
+                // that switches its press-start prompt away from the touch
+                // label) tests for the JOYSTICK source class, which plain
+                // AINPUT_SOURCE_GAMEPAD alone does not carry -- button events
+                // still registered and read as valid keycodes (hence the DOWN
+                // events showing up in the logs) but were invisible to that
+                // check, so the prompt never left touch mode no matter what
+                // was pressed.
                 AInputQueue_pushKeyEvent(inputQueue, LIMBO_DEVICE_GAMEPAD,
-                    AINPUT_SOURCE_GAMEPAD,
+                    AINPUT_SOURCE_GAMEPAD | AINPUT_SOURCE_JOYSTICK,
                     ev.type == SDL_CONTROLLERBUTTONDOWN ? AKEY_EVENT_ACTION_DOWN
                                                         : AKEY_EVENT_ACTION_UP,
                     keyCode, 0);
@@ -586,63 +831,6 @@ int main(int argc, char *argv[])
                 break;
             }
 
-            // ---- touch ----
-            //
-            // Limbo is an Android touch title: its menus and title screen are
-            // driven by MotionEvents from a touchscreen source, and the engine
-            // imports the whole AMotionEvent_get{Action,X,Y,PointerCount,
-            // PointerId} family to read them. Gamepad KeyEvents alone are not
-            // enough to get past the front end.
-            //
-            // The mouse stands in for a finger, and a real touch panel is passed
-            // through as-is. Coordinates go out in window pixels, matching what
-            // ANativeWindow_getWidth/getHeight report.
-            case SDL_MOUSEBUTTONDOWN:
-            case SDL_MOUSEBUTTONUP:
-            {
-                if (ev.button.button != SDL_BUTTON_LEFT)
-                    break;
-                const bool down = (ev.type == SDL_MOUSEBUTTONDOWN);
-                mouse_down = down;
-                int ww = 1, wh = 1;
-                SDL_GetWindowSize(sdl_win, &ww, &wh);
-                AInputQueue_pushMotionEvent(inputQueue, LIMBO_DEVICE_MOUSE,
-                    AINPUT_SOURCE_TOUCHSCREEN,
-                    down ? AMOTION_EVENT_ACTION_DOWN : AMOTION_EVENT_ACTION_UP,
-                    (float)ev.button.x / (float)ww * (float)winWidth,
-                    (float)ev.button.y / (float)wh * (float)winHeight);
-                break;
-            }
-
-            case SDL_MOUSEMOTION:
-            {
-                if (!mouse_down)
-                    break;    // a touchscreen only reports movement while held
-                int ww = 1, wh = 1;
-                SDL_GetWindowSize(sdl_win, &ww, &wh);
-                AInputQueue_pushMotionEvent(inputQueue, LIMBO_DEVICE_MOUSE,
-                    AINPUT_SOURCE_TOUCHSCREEN, AMOTION_EVENT_ACTION_MOVE,
-                    (float)ev.motion.x / (float)ww * (float)winWidth,
-                    (float)ev.motion.y / (float)wh * (float)winHeight);
-                break;
-            }
-
-            case SDL_FINGERDOWN:
-            case SDL_FINGERUP:
-            case SDL_FINGERMOTION:
-            {
-                // SDL normalises finger positions to 0..1 over the window.
-                const int32_t action =
-                    ev.type == SDL_FINGERDOWN ? AMOTION_EVENT_ACTION_DOWN :
-                    ev.type == SDL_FINGERUP   ? AMOTION_EVENT_ACTION_UP :
-                                                AMOTION_EVENT_ACTION_MOVE;
-                AInputQueue_pushMotionEvent(inputQueue, LIMBO_DEVICE_TOUCH,
-                    AINPUT_SOURCE_TOUCHSCREEN, action,
-                    ev.tfinger.x * (float)winWidth,
-                    ev.tfinger.y * (float)winHeight);
-                break;
-            }
-
             default:
                 break;
             }
@@ -652,7 +840,8 @@ int main(int argc, char *argv[])
         const int64_t frameTimeNanos =
             std::chrono::duration_cast<std::chrono::nanoseconds>(now - startTime).count();
 
-        // Re-report the playability / services gates once a second.
+        // Re-report the playability / services gates once a second, capped at
+        // a handful of attempts.
         //
         // On Android these arrive from Java whenever the licence check and Play
         // Games sign-in resolve, which is *after* the activity is up -- so the
@@ -660,13 +849,27 @@ int main(int argc, char *argv[])
         // at startup races that: if the game thread begins waiting after our
         // single call, the report is lost and it waits forever, which looks
         // exactly like a stuck title screen with no audio (gameplay never
-        // resumes, so neither does sound). Repeating is safe -- both are
-        // fire-and-forget setters on the engine side.
+        // resumes, so neither does sound).
+        //
+        // These are NOT harmless fire-and-forget setters, though: the engine
+        // treats every call as a fresh "just became playable" transition and
+        // redoes first-time setup around it, including tearing down and
+        // recreating its whole OpenSL audio engine (confirmed: slCreateEngine/
+        // CreateOutputMix/Realize repeating in lockstep with these calls), which
+        // also resets whatever clock baseline it times animation/audio playback
+        // against -- that's what was making the game run and sound sped up.
+        // A time-boxed window (e.g. "first 10 seconds") still fires several
+        // times during actual gameplay, since loading finishes in ~1-3s per the
+        // logs. Capping the attempt *count* instead means it always stops
+        // shortly after startup regardless of load time, while still covering
+        // the race the repeats exist for in the first place.
         {
+            static int attemptsLeft = 3;
             static int64_t lastGateNs = 0;
-            if (frameTimeNanos - lastGateNs > 1000000000LL)
+            if (attemptsLeft > 0 && frameTimeNanos - lastGateNs > 1000000000LL)
             {
                 lastGateNs = frameTimeNanos;
+                --attemptsLeft;
                 if (reportIsPlayable)
                     reportIsPlayable(env, activityObj, JNI_TRUE);
                 if (reportGameServices)
@@ -674,8 +877,55 @@ int main(int argc, char *argv[])
             }
         }
 
-        // Stands in for the Choreographer frame callback that drives the game.
-        reportVSync(env, activityObj, (jlong)frameTimeNanos);
+        // Stands in for the Choreographer frame callback that drives the game,
+        // throttled to a real ~60Hz cadence. This is also the correct rate --
+        // do not "fix" the resulting 30 FPS by raising it.
+        //
+        // This loop's only other throttle is a 1ms SDL_Delay below, so without
+        // this, reportVSync fires once per iteration -- 500-1000+ times a
+        // second, uncapped.
+        //
+        // Confirmed by decompiling Java_com_playdead_limbo_LimboActivity_
+        // native_1ReportVSyncCallEvent: on every call where the delta since
+        // the previous call is a normal cadence (<=20ms), the engine only
+        // actually renders/commits a frame on every OTHER call -- the rest
+        // just update bookkeeping and return. So real render rate is always
+        // exactly half whatever rate we call reportVSync at, no matter what
+        // that rate is. On top of that, the engine assumes a FIXED 1/30s
+        // timestep per rendered frame rather than measuring real elapsed
+        // time. At 60Hz calls, real time between rendered frames actually is
+        // ~33ms, so the fixed assumption is correct -> 1x speed, 30 FPS. At
+        // 120Hz calls, real time between rendered frames is only ~16.7ms but
+        // the engine still assumes 33ms passed -> 2x speed, 60 FPS. There is
+        // no rate that gives both 60 FPS and correct speed; the two are
+        // locked together by the engine's own fixed-timestep assumption, and
+        // 60Hz (30 FPS, correct speed) is the setting that is actually right.
+        {
+            constexpr int64_t VSYNC_INTERVAL_NS = 1'000'000'000LL / 60;
+            static int64_t lastVsyncNs = 0;
+            static bool haveLast = false;
+            const int64_t delta = frameTimeNanos - lastVsyncNs;
+
+            // Logged regardless of whether we're about to fire: a stall here
+            // is on our side (we're being called from the SDL_Delay(1) loop,
+            // so a >20ms gap since the last check is jitter/a stall, not
+            // normal). The engine logs its own "AndroidApp::OnVSyncEvent:
+            // vsync delta was X" when IT decides a delta means the display
+            // changed rate (sometimes adopting X as the new target, e.g.
+            // "adjusting to 30Hz display") -- this tells us whether a bad
+            // delta the engine reacts to originates on our side or entirely
+            // inside the engine's own handling of an on-time call.
+            if (haveLast && delta > 20'000'000LL)
+                printf("[vsync] %lld ns (%.1fms) since last check -- stall in our own loop\n",
+                    (long long)delta, delta / 1e6);
+
+            if (delta >= VSYNC_INTERVAL_NS)
+            {
+                lastVsyncNs = frameTimeNanos;
+                haveLast = true;
+                reportVSync(env, activityObj, (jlong)frameTimeNanos);
+            }
+        }
 
         // The engine renders and swaps on its own thread through our EGL shim
         // (eglSwapBuffers_impl -> SDL_GL_SwapWindow), so the loader must not

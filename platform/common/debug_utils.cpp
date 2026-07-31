@@ -40,8 +40,7 @@ void segfault_handler(int signal) {
     std::cerr << "Error: signal " << signal << ":\n";
     backtrace_symbols_fd(array, size, STDERR_FILENO);
 
-    // Exit the program
-    exit(1);
+    _exit(1);
 }
 
 void exit_handler(int signal) {

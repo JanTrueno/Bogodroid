@@ -12,6 +12,7 @@ extern toml::table config;
 #include "alooper.h"
 #include "asset_manager.h"
 #include "anative_activity.h"
+#include "egl_sdl.h"
 
 static ANativeWindow* default_native_window;
 
@@ -109,14 +110,45 @@ ABI_ATTR ANativeWindow* ANativeWindow_fromSurface(void*, void*)
     return default_native_window;
 }
 
+// On real Android this resizes the window's actual buffer and the system
+// compositor scales it up to the display when presenting -- Limbo uses it to
+// render at a fixed 1024x576 regardless of real screen size. We have no
+// compositor to do that scaling for us, so record the request; the render
+// thread's GL hooks and eglSwapBuffers_impl (gl_thread_bind.cpp, egl_sdl.cpp)
+// do the redirect-to-FBO-and-blit-stretch that emulates it. See the comment
+// on get_virtual_present_fbo() in egl_sdl.h.
+ABI_ATTR int32_t ANativeWindow_setBuffersGeometry(ANativeWindow *window, int32_t width, int32_t height, int32_t format)
+{
+    printf("[ndk] ANativeWindow_setBuffersGeometry(%d, %d, format=%d)\n", width, height, format);
+    // width/height == 0 means "match the window's natural size" -- i.e. no
+    // scaling override.
+    g_ana_buffer_w = width;
+    g_ana_buffer_h = height;
+    return 0;
+}
+
 ABI_ATTR int32_t ANativeWindow_getWidth(ANativeWindow *window)
 {
-    return config["device"]["displayWidth"].value_or<int>(640);
+    int32_t w = config["device"]["displayWidth"].value_or<int>(640);
+    static int32_t last_logged = -1;
+    if (w != last_logged)
+    {
+        printf("[ndk] ANativeWindow_getWidth = %d\n", w);
+        last_logged = w;
+    }
+    return w;
 }
 
 ABI_ATTR int32_t ANativeWindow_getHeight(ANativeWindow *window)
 {
-    return config["device"]["displayHeight"].value_or<int>(480);
+    int32_t h = config["device"]["displayHeight"].value_or<int>(480);
+    static int32_t last_logged = -1;
+    if (h != last_logged)
+    {
+        printf("[ndk] ANativeWindow_getHeight = %d\n", h);
+        last_logged = h;
+    }
+    return h;
 }
 
 ABI_ATTR void __assert2(const char* __file, int __line, const char* __function, const char* __msg)
@@ -155,7 +187,7 @@ NO_THUNK("ALooper_pollOnce", (uintptr_t)&ALooper_pollOnce), //AWFUL
 NO_THUNK("ANativeWindow_fromSurface", (uintptr_t)&ANativeWindow_fromSurface), //AWFUL
 NO_THUNK("ANativeWindow_acquire", (uintptr_t)&ret0), //AWFUL
 NO_THUNK("ANativeWindow_release", (uintptr_t)&ret0), //AWFUL
-NO_THUNK("ANativeWindow_setBuffersGeometry", (uintptr_t)&ret0), //AWFUL
+NO_THUNK("ANativeWindow_setBuffersGeometry", (uintptr_t)&ANativeWindow_setBuffersGeometry),
 NO_THUNK("ANativeWindow_getWidth", (uintptr_t)&ANativeWindow_getWidth),
 NO_THUNK("ANativeWindow_getHeight", (uintptr_t)&ANativeWindow_getHeight),
 NO_THUNK("__assert2", (uintptr_t)&__assert2),

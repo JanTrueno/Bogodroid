@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <cerrno>
 #include <stdarg.h>   // openat_impl is variadic
+#include "io_util.h"
 
 char* clean_jar_path(const char* path) {
     if (!path) return NULL;
@@ -129,6 +130,8 @@ ABI_ATTR int open_impl(const char *filename, int flags, mode_t mode)
     // }
     
     char* clean_path = clean_jar_path(filename);
+    if (flags & O_CREAT)
+        ensure_parent_dirs(clean_path);
     int fd = open(clean_path, flags, mode);
     verbose("NATIVE","Got file descriptor %d",fd);
     return fd;

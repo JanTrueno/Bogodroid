@@ -9,6 +9,13 @@
 
 #include "platform.h"
 #include "bionic_file.h"
+#include "io_util.h"
+
+// fopen() modes that create the file if it doesn't exist ("r" alone does not).
+static bool mode_creates_file(const char *mode)
+{
+    return mode && (mode[0] == 'w' || mode[0] == 'a' || strchr(mode, '+'));
+}
 
 #define _get_from(x) ((FILE*)((x)->_cookie))
 
@@ -24,6 +31,8 @@ BIONIC_FILE *stderr_impl = &__sF_fake[2];
 
 ABI_ATTR BIONIC_FILE *fopen_impl(const char *arg1, const char* arg2)
 {
+    if (mode_creates_file(arg2))
+        ensure_parent_dirs(arg1);
     FILE *f = fopen(arg1, arg2);
     if (!f)
         return NULL;
@@ -35,6 +44,8 @@ ABI_ATTR BIONIC_FILE *fopen_impl(const char *arg1, const char* arg2)
 
 ABI_ATTR BIONIC_FILE *fopen64_impl(const char *arg1, const char* arg2)
 {
+    if (mode_creates_file(arg2))
+        ensure_parent_dirs(arg1);
     FILE *f = fopen64(arg1, arg2);
     if (!f)
         return NULL;
