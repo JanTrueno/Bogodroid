@@ -135,6 +135,7 @@ See `tools/unity_traces` for a trace of a minimal Unity game starting up
 | Professor Layton and the Curious Village HD | laytonloader | Working | Graphics, audio, touch/keyboard input and cutscenes work. |
 | Professor Layton and Pandora's Box HD | layton2loader | Untested | Adapted from laytonloader (libll2.so exports plain C entry points via a libjniproxy.so the loader bypasses, unlike libll1.so's direct JNI-named exports). Not yet run. |
 | Professor Layton and the Lost/Unwound Future HD | layton3loader | Untested | Adapted from layton2loader; adds a data0.cpp ZIP-pack asset fallback (assets/data0) that L1/L2 do not need. Not yet run. |
+| Geometry Dash (com.robtopx.geometryjump) | gdashloader | Working | Ported from gdash_nx (Switch). Cocos2d-x 2.2 fork + stock libfmod.so, assets loaded loose, FMOD via SDL audio, touch synthesized from gamepad/keyboard/mouse, frame-delta clamp for load stalls. |
 | Super Hexagon                     | hexagonloader | Not Booting   | Unchanged from Pre-NEO Bogodroid, needs complete rework  |
 | Limbo                             | limboloader   | Untested      | Reworked for NEO (arm64). Full ANativeActivity lifecycle, native AInputQueue input (gamepad + keyboard), asset manager and OpenSL ES audio. Not yet run on hardware. |
 | Crazy Taxi Classic                | taxiloader    | Investigated  | Requires better file handling for loading the big OBB files, before it can be attempted.                           |

@@ -1,0 +1,34 @@
+[paths]
+
+game_files="../gamefiles/gdash/"
+support_files="../gamefiles/support_files/"
+
+android_package_code="/fakepath_package_code"
+android_external_files="/fakepath_external_files"
+android_files="/fakepath_files"
+android_obb_dirs=["/fakepath_obb"]
+android_source_dirs=["/fakepath_source"]
+android_cache="cache/"
+
+
+[package]
+
+packageName="com.robtopx.geometryjump"
+versionName="2.2.14"
+mainIntentBundle = {}
+
+
+[device]
+
+# Render resolution. The SDL window (and thus the EGL surface) is created at
+# this size, and the game is told to render at it, so it should match the
+# display you are running on.
+displayWidth=1280
+displayHeight=720
+fullscreen=false
+
+
+[input]
+
+# Pointer speed of the stick/d-pad-driven cursor, px/s at 720p.
+cursorSpeed=675.0

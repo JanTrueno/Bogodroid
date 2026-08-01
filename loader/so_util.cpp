@@ -49,7 +49,9 @@
 
 #define PATCH_SZ 0x10000 // 64 KB-ish arenas
 static so_module* head = NULL;
+static bool defer_init = false;
 so_module* so_get_head() { return head; }
+void so_set_defer_init(int defer) { defer_init = defer != 0; }
 
 // rela_functor functions should return 1 to stop, or 0 to continue executing,
 // and will receive the module and relocation data from the relocation iterator
@@ -58,7 +60,7 @@ using rela_functor = std::function<int(so_module* mod, const Elf_Rela* rel)>;
 void foreach_rela(so_module* mod, rela_functor functor);
 void so_relocate_all(so_module* mod);
 
-static void so_flush_caches(so_module* mod, int write)
+void so_flush_caches(so_module* mod, int write)
 {
     // clear cache and set EXEC on all executable regions
     __builtin___clear_cache((void*)mod->patch_base, (void*)(mod->cave_head));
@@ -296,7 +298,8 @@ int so_load(so_module* mod, const char* filename, uintptr_t load_addr, void* so_
     so_relocate_all(mod);
     so_static_overrides(mod);
     so_flush_caches(mod, 1);
-    so_initialize(mod);
+    if (!defer_init)
+        so_initialize(mod);
 
     // Register the loaded shared file for future reference, say, during the
     // resolution of dynamic symbol names.

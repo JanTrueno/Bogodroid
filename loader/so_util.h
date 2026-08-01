@@ -117,10 +117,12 @@ void hook_symbol(so_module *mod, const char *symbol, uintptr_t dst, int is_optio
 void hook_symbols(so_module *mod, DynLibHooks *hooks);
 
 int so_load(so_module *mod, const char *filename, uintptr_t load_addr, void *so_data, size_t sz);
+void so_set_defer_init(int defer);
 void so_relocate(so_module *mod);
 int so_static_overrides(so_module *mod);
 uintptr_t so_resolve_link(so_module *mod, const char *symbol);
 void so_initialize(so_module *mod);
+void so_flush_caches(so_module *mod, int write);
 uintptr_t so_symbol(so_module *mod, const char *symbol);
 int so_symbol_index(so_module *mod, const char *symbol);
 void so_symbol_fix_ldmia(so_module *mod, const char *symbol);

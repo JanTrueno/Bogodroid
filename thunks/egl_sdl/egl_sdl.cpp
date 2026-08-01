@@ -881,8 +881,15 @@ void sdl_initialize_gles()
     if (sdl_ctx == NULL) {
         fatal_error("Failed to create OpenGL Context: %s\n", SDL_GetError());
     }
+    SDL_GL_MakeCurrent(sdl_win, sdl_ctx);
 
-    // SDL_GL_DeleteContext(sdl_ctx);
-    // SDL_DestroyWindow(sdl_win);
-    // SDL_Quit();
+    // Capture the real EGL handles behind the SDL context. eglSwapBuffers_impl
+    // presents with these, so leaving them null makes every swap a no-op
+    // against EGL_NO_DISPLAY -- a black window that never blocks on vsync.
+    // Games that drive EGL themselves overwrite these via eglMakeCurrent_impl;
+    // ones that only import GLES (Geometry Dash) never do, so seed them here.
+    egl_display = ((EGLDisplay (*)())getProc("eglGetCurrentDisplay"))();
+    egl_context = ((EGLContext (*)())getProc("eglGetCurrentContext"))();
+    egl_surface = ((EGLSurface (*)(EGLint))getProc("eglGetCurrentSurface"))(EGL_DRAW);
+    printf("[egl] display=%p context=%p surface=%p\n", egl_display, egl_context, egl_surface);
 }
