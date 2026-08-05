@@ -787,6 +787,12 @@ int main(int argc, char *argv[])
     // Init config (also chdir's into paths.game_files)
     init_config(argv[1]);
 
+    // Real sockets (glibc is the bionic socket ABI; same as the Switch port's
+    // net_shim.c but without the ABI conversion) unless the config turns the
+    // fail-fast offline stubs back on. Must run before either game lib loads:
+    // relocation reads the table once.
+    gdash_network_init(config["network"]["enabled"].value_or<bool>(true));
+
     screen_width = config["device"]["displayWidth"].value_or<int>(1280);
     screen_height = config["device"]["displayHeight"].value_or<int>(720);
     cursor_speed = config["input"]["cursorSpeed"].value_or<double>(675.0);

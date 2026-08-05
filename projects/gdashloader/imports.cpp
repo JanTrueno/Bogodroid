@@ -545,6 +545,103 @@ static void *gethostbyname_none(const char *name) {
     return NULL;
 }
 
+// The remaining entry points are not reachable after socket()/getaddrinfo()
+// fail, but they must NOT fall through to glibc: gethostbyname_r would do a
+// real DNS lookup (with the resolver's retry/timeout behaviour -- exactly the
+// "spins through DNS for minutes" hang the stubs exist to prevent), and a
+// real socketpair() would hand back fds that select()/poll() would then wait
+// on forever. Fail them all the same way.
+static int gethostbyname_r_none(const char *name, void *ret, char *buf, size_t buflen,
+                                void **result, int *h_errnop) {
+    (void)name; (void)ret; (void)buf; (void)buflen;
+    if (result)
+        *result = NULL;
+    if (h_errnop)
+        *h_errnop = 1; // HOST_NOT_FOUND
+    errno = EBADF;
+    return -1;
+}
+
+static int getnameinfo_none(const void *sa, unsigned salen, char *host, unsigned hostlen,
+                            char *serv, unsigned servlen, int flags) {
+    (void)sa; (void)salen; (void)host; (void)hostlen; (void)serv; (void)servlen; (void)flags;
+    return EAI_FAIL;
+}
+
+static int socketpair_none(int domain, int type, int protocol, int sv[2]) {
+    (void)domain; (void)type; (void)protocol; (void)sv;
+    errno = EBADF;
+    return -1;
+}
+
+static int bind_none(int fd, const void *addr, unsigned addrlen) {
+    (void)fd; (void)addr; (void)addrlen;
+    errno = EBADF;
+    return -1;
+}
+
+static int getsockname_none(int fd, void *addr, unsigned *addrlen) {
+    (void)fd; (void)addr; (void)addrlen;
+    errno = EBADF;
+    return -1;
+}
+
+static int getpeername_none(int fd, void *addr, unsigned *addrlen) {
+    (void)fd; (void)addr; (void)addrlen;
+    errno = EBADF;
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// network on/off switch
+//
+// glibc IS the bionic socket ABI on this platform (same sockaddr layout, same
+// errno values, same fd table), and symtable_libc already THUNK_DIRECTs the
+// whole socket family to glibc -- the _none stubs above only exist to shadow
+// it. This is the Bogodroid equivalent of the Switch port's net_shim.c: real
+// sockets end to end, minus the bionic<->BSD conversion. The table is walked
+// before either game lib is loaded, so relocation binds whichever side is
+// selected for every socket import.
+//
+// With networking on, a dead server can stall the game's connect/DNS retry
+// loop for minutes (the reason the stubs were added in the first place) -- if
+// that bites, set [network] enabled=false in the config and rebuild.
+// ---------------------------------------------------------------------------
+
+struct NetSym { const char *symbol; uintptr_t stub; uintptr_t real; };
+
+static const NetSym g_net_syms[] = {
+    { "socket",          (uintptr_t)&socket_none,          (uintptr_t)&socket },
+    { "connect",         (uintptr_t)&connect_none,         (uintptr_t)&connect },
+    { "send",            (uintptr_t)&send_none,            (uintptr_t)&send },
+    { "recv",            (uintptr_t)&recv_none,            (uintptr_t)&recv },
+    { "sendto",          (uintptr_t)&sendto_none,          (uintptr_t)&sendto },
+    { "recvfrom",        (uintptr_t)&recvfrom_none,        (uintptr_t)&recvfrom },
+    { "accept",          (uintptr_t)&accept_none,          (uintptr_t)&accept },
+    { "listen",          (uintptr_t)&listen_none,          (uintptr_t)&listen },
+    { "shutdown",        (uintptr_t)&shutdown_none,        (uintptr_t)&shutdown },
+    { "bind",            (uintptr_t)&bind_none,            (uintptr_t)&bind },
+    { "getpeername",     (uintptr_t)&getpeername_none,     (uintptr_t)&getpeername },
+    { "getsockname",     (uintptr_t)&getsockname_none,     (uintptr_t)&getsockname },
+    { "socketpair",      (uintptr_t)&socketpair_none,      (uintptr_t)&socketpair },
+    { "getaddrinfo",     (uintptr_t)&getaddrinfo_none,     (uintptr_t)&getaddrinfo },
+    { "freeaddrinfo",    (uintptr_t)&freeaddrinfo_none,    (uintptr_t)&freeaddrinfo },
+    { "getnameinfo",     (uintptr_t)&getnameinfo_none,     (uintptr_t)&getnameinfo },
+    { "gethostbyname",   (uintptr_t)&gethostbyname_none,   (uintptr_t)&gethostbyname },
+    { "gethostbyname_r", (uintptr_t)&gethostbyname_r_none, (uintptr_t)&gethostbyname_r },
+};
+
+void gdash_network_init(bool enabled) {
+    for (size_t i = 0; symtable_gdash[i].symbol; i++) {
+        for (size_t j = 0; j < sizeof(g_net_syms) / sizeof(g_net_syms[0]); j++) {
+            if (strcmp(symtable_gdash[i].symbol, g_net_syms[j].symbol) == 0) {
+                symtable_gdash[i].func = enabled ? g_net_syms[j].real : g_net_syms[j].stub;
+                break;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // import table
 // ---------------------------------------------------------------------------
@@ -704,9 +801,15 @@ DynLibFunction symtable_gdash[] = {
   { "accept", (uintptr_t)&accept_none },
   { "listen", (uintptr_t)&listen_none },
   { "shutdown", (uintptr_t)&shutdown_none },
+  { "bind", (uintptr_t)&bind_none },
+  { "getpeername", (uintptr_t)&getpeername_none },
+  { "getsockname", (uintptr_t)&getsockname_none },
+  { "socketpair", (uintptr_t)&socketpair_none },
   { "getaddrinfo", (uintptr_t)&getaddrinfo_none },
   { "freeaddrinfo", (uintptr_t)&freeaddrinfo_none },
+  { "getnameinfo", (uintptr_t)&getnameinfo_none },
   { "gethostbyname", (uintptr_t)&gethostbyname_none },
+  { "gethostbyname_r", (uintptr_t)&gethostbyname_r_none },
 
   // --- OpenSL ES (libfmod probes it; fail gracefully -> AudioTrack) ---------
   { "slCreateEngine", (uintptr_t)&slCreateEngine_gd },

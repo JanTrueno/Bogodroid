@@ -32,3 +32,12 @@ fullscreen=false
 
 # Pointer speed of the stick/d-pad-driven cursor, px/s at 720p.
 cursorSpeed=675.0
+
+
+[network]
+
+# Real sockets (glibc IS the bionic socket ABI, so this is the same end
+# result as the Switch port's net_shim.c with no conversion needed). With
+# networking on, a dead server can stall the game's connect/DNS retry loop
+# for minutes -- if that bites, set this back to false and rebuild.
+enabled=true
