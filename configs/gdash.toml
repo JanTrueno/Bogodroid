@@ -37,7 +37,11 @@ cursorSpeed=675.0
 [network]
 
 # Real sockets (glibc IS the bionic socket ABI, so this is the same end
-# result as the Switch port's net_shim.c with no conversion needed). With
-# networking on, a dead server can stall the game's connect/DNS retry loop
-# for minutes -- if that bites, set this back to false and rebuild.
+# result as the Switch port's net_shim.c with no conversion needed).
 enabled=true
+
+# Bounds a single TCP connect attempt in ms. The kernel otherwise re-sends
+# SYNs to a dead server for ~2 minutes before giving up, which stalls the
+# game's retry loop; with this the connect fails fast, the game shows
+# "server offline" and plays on. 0 = no bound (kernel default).
+connect_timeout_ms=4000

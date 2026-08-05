@@ -58,6 +58,7 @@
 #include <grp.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <poll.h>
 #include <pwd.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -602,17 +603,56 @@ static int getpeername_none(int fd, void *addr, unsigned *addrlen) {
 // sockets end to end, minus the bionic<->BSD conversion. The table is walked
 // before either game lib is loaded, so relocation binds whichever side is
 // selected for every socket import.
-//
-// With networking on, a dead server can stall the game's connect/DNS retry
-// loop for minutes (the reason the stubs were added in the first place) -- if
-// that bites, set [network] enabled=false in the config and rebuild.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// connect with a bounded timeout
+//
+// To a dead server the kernel's TCP connect keeps re-sending SYNs for ~2
+// minutes (tcp_syn_retries) -- exactly the "spins for minutes" stall the
+// offline stubs existed to prevent. When networking is enabled the connect
+// import is bound to this wrapper instead of plain glibc: the socket goes
+// non-blocking, connect() is started, and poll() bounds the wait to
+// connect_timeout_ms ([network] connect_timeout_ms in the config). A dead
+// server then fails in seconds, the game reports "server offline" and plays
+// on; a live one connects normally with the socket returned to blocking mode
+// either way.
+// ---------------------------------------------------------------------------
+
+static int g_connect_timeout_ms = 4000;
+
+static int connect_gd(int fd, const struct sockaddr *addr, socklen_t addrlen) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0 && !(flags & O_NONBLOCK))
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int r = connect(fd, addr, addrlen);
+    if (r != 0 && errno == EINPROGRESS) {
+        struct pollfd pfd = { fd, POLLOUT, 0 };
+        r = poll(&pfd, 1, g_connect_timeout_ms);
+        if (r > 0) {
+            int soerr = 0;
+            socklen_t sl = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0 && soerr == 0)
+                r = 0; // connected
+            else {
+                errno = soerr ? soerr : ETIMEDOUT;
+                r = -1;
+            }
+        } else if (r == 0) {
+            errno = ETIMEDOUT;
+            r = -1;
+        }
+    }
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags); // restore blocking mode either way
+    return r;
+}
 
 struct NetSym { const char *symbol; uintptr_t stub; uintptr_t real; };
 
 static const NetSym g_net_syms[] = {
     { "socket",          (uintptr_t)&socket_none,          (uintptr_t)&socket },
-    { "connect",         (uintptr_t)&connect_none,         (uintptr_t)&connect },
+    { "connect",         (uintptr_t)&connect_none,         (uintptr_t)&connect_gd },
     { "send",            (uintptr_t)&send_none,            (uintptr_t)&send },
     { "recv",            (uintptr_t)&recv_none,            (uintptr_t)&recv },
     { "sendto",          (uintptr_t)&sendto_none,          (uintptr_t)&sendto },
@@ -631,7 +671,9 @@ static const NetSym g_net_syms[] = {
     { "gethostbyname_r", (uintptr_t)&gethostbyname_r_none, (uintptr_t)&gethostbyname_r },
 };
 
-void gdash_network_init(bool enabled) {
+void gdash_network_init(bool enabled, int connect_timeout_ms) {
+    if (connect_timeout_ms > 0)
+        g_connect_timeout_ms = connect_timeout_ms;
     for (size_t i = 0; symtable_gdash[i].symbol; i++) {
         for (size_t j = 0; j < sizeof(g_net_syms) / sizeof(g_net_syms[0]); j++) {
             if (strcmp(symtable_gdash[i].symbol, g_net_syms[j].symbol) == 0) {

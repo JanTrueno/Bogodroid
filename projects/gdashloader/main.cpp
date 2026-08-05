@@ -789,9 +789,12 @@ int main(int argc, char *argv[])
 
     // Real sockets (glibc is the bionic socket ABI; same as the Switch port's
     // net_shim.c but without the ABI conversion) unless the config turns the
-    // fail-fast offline stubs back on. Must run before either game lib loads:
+    // fail-fast offline stubs back on. connect_timeout_ms bounds each TCP
+    // connect attempt so a dead server fails in seconds instead of stalling
+    // on kernel SYN retries. Must run before either game lib loads:
     // relocation reads the table once.
-    gdash_network_init(config["network"]["enabled"].value_or<bool>(true));
+    gdash_network_init(config["network"]["enabled"].value_or<bool>(true),
+                       config["network"]["connect_timeout_ms"].value_or<int>(4000));
 
     screen_width = config["device"]["displayWidth"].value_or<int>(1280);
     screen_height = config["device"]["displayHeight"].value_or<int>(720);
