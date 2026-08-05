@@ -20,20 +20,30 @@ mainIntentBundle = {}
 
 [device]
 
-# Window size (ignored when fullscreen -- the drawable size is queried from
-# SDL instead).
+# Window size -- ignored whenever SDL reports 2+ displays (real dual-screen
+# hardware: the loader combines them into one stacked portrait window sized
+# from the panels' actual reported resolution, see sdl_initialize_gles() in
+# thunks/egl_sdl/egl_sdl.cpp) and also ignored when fullscreen=true on a
+# single display (the drawable size is queried from SDL instead).
 displayWidth=1920
 displayHeight=1080
 fullscreen=true
 
 # Orientation of the game view:
-#   0        landscape -- the game fills the panel as-is
-#   90 / 270 portrait  -- the DS layout (two screens stacked) is rendered
-#                         portrait and rotated onto a widescreen panel; use
-#                         270 if 90 comes out upside down for how you hold it
+#   0        landscape -- the game fills the panel as-is. Also required on
+#            real dual-screen hardware (2 displays detected): the DS's
+#            top/bottom layout is already portrait, so it renders straight
+#            into the combined window with no FBO/rotation blit -- top
+#            screen content lands in the top half, bottom screen content in
+#            the bottom half, matching the original hardware directly.
+#   90 / 270 portrait  -- for a SINGLE widescreen panel only: the DS layout
+#                         is rendered portrait into an offscreen FBO and
+#                         rotated onto the panel; use 270 if 90 comes out
+#                         upside down for how you hold it
 #   180      landscape, flipped
 # L1 / R1 rotate this at runtime, so it is easy to find the one you want.
-displayRotation=90
+# (ignored entirely when 2 displays are detected -- always treated as 0)
+displayRotation=0
 
 
 [input]

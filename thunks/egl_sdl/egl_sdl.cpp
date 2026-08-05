@@ -19,6 +19,7 @@ SDL_GLContext sdl_ctx;
 EGLDisplay egl_display;
 EGLContext egl_context;
 EGLSurface egl_surface;
+int dual_screen_split_y = 0;
 
 // A surface handle that is neither NULL/EGL_NO_SURFACE (which
 // eglCreatePbufferSurface's contract defines as "failed", and Limbo's own
@@ -825,13 +826,44 @@ void sdl_initialize_gles()
     }
     int win_width = config["device"]["displayWidth"].value_or<int>(640);
     int win_height = config["device"]["displayHeight"].value_or<int>(480);
+    int win_x = SDL_WINDOWPOS_UNDEFINED;
+    int win_y = SDL_WINDOWPOS_UNDEFINED;
     const bool want_fullscreen = config["device"]["fullscreen"].value_or<bool>(false);
 
     const char *driver = SDL_GetCurrentVideoDriver();
     printf("SDL video driver: %s\n", driver ? driver : "(none)");
 
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL;
-    if (want_fullscreen) {
+    bool dual_screen = false;
+
+    const int num_displays = SDL_GetNumVideoDisplays();
+    printf("SDL reports %d display(s)\n", num_displays);
+
+    if (num_displays >= 2) {
+        // Two physical panels stacked into one portrait output -- e.g. a real
+        // dual-screen device recreating the DS's top/bottom layout. Sizes and
+        // positions are queried live, never hardcoded, so this adapts to
+        // whatever the two panels actually report. Pair this with
+        // device.displayRotation=0 in the config: the game then renders
+        // straight into this window with no FBO/rotation blit, so its top
+        // screen content lands in the top half and bottom screen content in
+        // the bottom half, same as the original hardware.
+        SDL_Rect b0 = {}, b1 = {};
+        SDL_GetDisplayBounds(0, &b0);
+        SDL_GetDisplayBounds(1, &b1);
+
+        dual_screen_split_y = b0.h;
+        win_width = (b0.w > b1.w) ? b0.w : b1.w;
+        win_height = b0.h + b1.h;
+        win_x = (b0.x < b1.x) ? b0.x : b1.x;
+        win_y = (b0.y < b1.y) ? b0.y : b1.y;
+        dual_screen = true;
+
+        printf("Dual-screen: display0 %dx%d @ (%d,%d) + display1 %dx%d @ (%d,%d) "
+               "-> combined window %dx%d @ (%d,%d), split at y=%d\n",
+               b0.w, b0.h, b0.x, b0.y, b1.w, b1.h, b1.x, b1.y,
+               win_width, win_height, win_x, win_y, dual_screen_split_y);
+    } else if (want_fullscreen) {
         // Size the window to the display up front. On kmsdrm the window is the
         // whole display anyway; under X11/XWayland a window already at the
         // display size still covers the screen even if the compositor refuses
@@ -846,12 +878,18 @@ void sdl_initialize_gles()
         win_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     }
 
-    sdl_win = SDL_CreateWindow("Loader", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, win_width, win_height, win_flags);
+    sdl_win = SDL_CreateWindow("Loader", win_x, win_y, win_width, win_height, win_flags);
     if (sdl_win == NULL) {
         fatal_error("Failed to create SDL Window: %s\n", SDL_GetError());
     }
 
-    if (want_fullscreen) {
+    if (dual_screen) {
+        // SDL_WINDOW_FULLSCREEN_DESKTOP is tied to a single display, so it
+        // cannot span two -- a borderless window positioned/sized to cover
+        // both outputs is the only way to present across both at once.
+        SDL_SetWindowBordered(sdl_win, SDL_FALSE);
+        SDL_SetWindowPosition(sdl_win, win_x, win_y);
+    } else if (want_fullscreen) {
         // Re-assert after creation: this is what actually takes effect on
         // window managers that ignored the creation flag (common on XWayland
         // without a compositor managing the surface). Harmless on kmsdrm,

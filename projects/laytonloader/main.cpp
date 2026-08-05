@@ -600,6 +600,17 @@ int main(int argc, char *argv[])
         printf("displayRotation=%d is not one of 0/90/180/270 -- ignoring\n", rotation);
         rotation = 0;
     }
+    if (dual_screen_split_y > 0 && rotation != 0)
+    {
+        // The FBO/rotation-blit path is for one widescreen panel showing a
+        // rotated portrait image. On real dual-screen hardware the window is
+        // already the correctly-oriented portrait canvas (see
+        // sdl_initialize_gles()), so rotating it would misalign the top/
+        // bottom split from the physical screens -- force it off regardless
+        // of what the config says.
+        printf("2 displays detected -- ignoring displayRotation=%d, forcing 0\n", rotation);
+        rotation = 0;
+    }
     int viewWidth = 0, viewHeight = 0;
 
     // Applies a rotation: rebuilds the offscreen target and tells the engine
@@ -716,8 +727,11 @@ int main(int argc, char *argv[])
             }
             else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT)
                 mouse_down = false;
-            // L1 / R1 rotate the display, 90 degrees at a time
-            else if (ev.type == SDL_CONTROLLERBUTTONDOWN &&
+            // L1 / R1 rotate the display, 90 degrees at a time -- meaningless
+            // on real dual-screen hardware (rotation is forced to 0 above,
+            // and rotating would misalign the split from the physical
+            // screens), so it is a no-op there.
+            else if (dual_screen_split_y == 0 && ev.type == SDL_CONTROLLERBUTTONDOWN &&
                      (ev.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER ||
                       ev.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER))
             {
@@ -776,8 +790,29 @@ int main(int argc, char *argv[])
             glBindFramebuffer(GL_FRAMEBUFFER, rot.fbo);
         glViewport(0, 0, viewWidth, viewHeight);
 
+        // Cutscenes are authored for one DS screen. On a real stacked
+        // dual-screen setup (rotation == 0, so view space == window space,
+        // see egl_sdl.cpp) the engine's own MO_Render would otherwise center
+        // the video across the combined portrait canvas, splitting it across
+        // both screens. Blank the window and scissor-clip the game's whole
+        // draw to the top screen's real height while a movie is active, then
+        // release it immediately after -- the cursor/OSK block below and the
+        // next frame's UI must not be clipped.
+        const bool clampToTopScreen = dual_screen_split_y > 0 && movie_active();
+        if (clampToTopScreen)
+        {
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(0.f, 0.f, 0.f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(0, 0, viewWidth, dual_screen_split_y);
+        }
+
         // frame_step=1, button=0 (unused), then the touch state
         gameRender(env, activityObj, 1, 0, touchNum, tx1, ty1, tx2, ty2);
+
+        if (clampToTopScreen)
+            glDisable(GL_SCISSOR_TEST);
 
         // Drawn into the same target the game just used, in view space, so it
         // lands exactly on the point fed to the engine and rotates with it.

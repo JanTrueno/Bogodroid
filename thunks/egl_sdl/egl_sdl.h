@@ -34,3 +34,9 @@ extern int g_ana_buffer_h;
 // Returns 0 if no buffer-geometry override is active (game gets the real
 // window framebuffer as normal).
 unsigned int get_virtual_present_fbo();
+
+// Real pixel Y-coordinate where the "top" physical screen ends and the
+// "bottom" one begins, when sdl_initialize_gles() combined two SDL displays
+// into one stacked window (see egl_sdl.cpp). 0 when there is only one
+// display -- callers must check this before treating it as a split point.
+extern int dual_screen_split_y;
