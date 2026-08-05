@@ -877,9 +877,7 @@ int main(int argc, char *argv[])
             }
         }
 
-        // Stands in for the Choreographer frame callback that drives the game,
-        // throttled to a real ~60Hz cadence. This is also the correct rate --
-        // do not "fix" the resulting 30 FPS by raising it.
+        // Stands in for the Choreographer frame callback that drives the game.
         //
         // This loop's only other throttle is a 1ms SDL_Delay below, so without
         // this, reportVSync fires once per iteration -- 500-1000+ times a
@@ -888,23 +886,49 @@ int main(int argc, char *argv[])
         // Confirmed by decompiling Java_com_playdead_limbo_LimboActivity_
         // native_1ReportVSyncCallEvent: on every call where the delta since
         // the previous call is a normal cadence (<=20ms), the engine only
-        // actually renders/commits a frame on every OTHER call -- the rest
-        // just update bookkeeping and return. So real render rate is always
-        // exactly half whatever rate we call reportVSync at, no matter what
-        // that rate is. On top of that, the engine assumes a FIXED 1/30s
-        // timestep per rendered frame rather than measuring real elapsed
-        // time. At 60Hz calls, real time between rendered frames actually is
-        // ~33ms, so the fixed assumption is correct -> 1x speed, 30 FPS. At
-        // 120Hz calls, real time between rendered frames is only ~16.7ms but
-        // the engine still assumes 33ms passed -> 2x speed, 60 FPS. There is
-        // no rate that gives both 60 FPS and correct speed; the two are
-        // locked together by the engine's own fixed-timestep assumption, and
-        // 60Hz (30 FPS, correct speed) is the setting that is actually right.
+        // actually signals its render thread on every OTHER call -- the rest
+        // just update bookkeeping and return (the "last == prev-prev" skip;
+        // only [last] is re-stored on skipped calls, so [prev] trails one
+        // report behind and the skip toggles every call). On a 30Hz-display
+        // cadence (20-50ms delta, "adjusting to 30Hz display") it signals
+        // every call. So:
+        //
+        //   60Hz reports -> 30 signals/s -> 30 rendered frames/s, and every
+        //   rendered frame measures the real elapsed time (~33ms) via
+        //   clock_gettime (the engine has no fixed 1/30s timestep constant
+        //   anywhere -- no 0.033333f/double, no 33333333ns -- frame time is
+        //   measured per frame and clamped to [~1us, 100ms]), so simulation
+        //   runs at exactly 1x speed.
+        //
+        //   120Hz reports -> 60 signals/s -> 60 rendered frames/s at ~16.7ms
+        //   measured per frame -> 1x speed at 60 FPS.
+        //
+        // The older note in this spot claimed 120Hz runs the sim at 2x speed
+        // ("the engine still assumes 33ms passed") -- that observation was
+        // made before the reportIsPlayable/reportGameServices repeat-call fix
+        // below, whose engine-side side effect (tearing down and recreating
+        // the OpenSL audio engine and resetting the animation clock baseline)
+        // is what actually sped the game up. Nothing in libLimbo.so fixes the
+        // sim timestep to 1/30, so 120Hz reports are safe to try; if gameplay
+        // ever measures fast, drop back to 1'000'000'000LL / 60.
+        //
+        // The previous implementation reset lastVsyncNs to the *check* time
+        // on each fire, so every SDL_Delay(1) poll's 1-2ms latency
+        // accumulated and reports came out at ~57-58Hz -- the engine's
+        // every-other-frame rule turned that into ~28.5 FPS. The deadline is
+        // now advanced by a fixed interval instead, so the report cadence is
+        // exact regardless of how late the poll runs, and any backlog (a
+        // stall >8.3ms) is flushed with on-time deltas so the engine never
+        // sees a "slow vsync" it might react to.
+        //
+        // [video] vsync_hz selects the report rate: 120 -> 60 FPS, 60 ->
+        // 30 FPS (see above). Defaults to 120.
         {
-            constexpr int64_t VSYNC_INTERVAL_NS = 1'000'000'000LL / 60;
-            static int64_t lastVsyncNs = 0;
+            static const int64_t vsyncIntervalNs =
+                1'000'000'000LL / config["video"]["vsync_hz"].value_or<int>(120);
+            static int64_t nextVsyncNs = -1;
+            static int64_t lastCheckNs = 0;
             static bool haveLast = false;
-            const int64_t delta = frameTimeNanos - lastVsyncNs;
 
             // Logged regardless of whether we're about to fire: a stall here
             // is on our side (we're being called from the SDL_Delay(1) loop,
@@ -915,16 +939,20 @@ int main(int argc, char *argv[])
             // "adjusting to 30Hz display") -- this tells us whether a bad
             // delta the engine reacts to originates on our side or entirely
             // inside the engine's own handling of an on-time call.
-            if (haveLast && delta > 20'000'000LL)
+            if (haveLast && frameTimeNanos - lastCheckNs > 20'000'000LL)
                 printf("[vsync] %lld ns (%.1fms) since last check -- stall in our own loop\n",
-                    (long long)delta, delta / 1e6);
+                    (long long)(frameTimeNanos - lastCheckNs),
+                    (frameTimeNanos - lastCheckNs) / 1e6);
+            lastCheckNs = frameTimeNanos;
 
-            if (delta >= VSYNC_INTERVAL_NS)
+            if (nextVsyncNs < 0)
+                nextVsyncNs = frameTimeNanos;
+            while (frameTimeNanos >= nextVsyncNs)
             {
-                lastVsyncNs = frameTimeNanos;
-                haveLast = true;
-                reportVSync(env, activityObj, (jlong)frameTimeNanos);
+                reportVSync(env, activityObj, (jlong)nextVsyncNs);
+                nextVsyncNs += vsyncIntervalNs;
             }
+            haveLast = true;
         }
 
         // The engine renders and swaps on its own thread through our EGL shim

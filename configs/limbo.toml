@@ -51,6 +51,22 @@ language="en"
 country="US"
 
 
+[video]
+
+# Emulated vsync rate fed to native_ReportVSyncCallEvent (see the frame loop
+# in projects/limboloader/main.cpp).
+#
+# The engine signals its render thread on every OTHER report at a normal
+# <=20ms cadence, and measures real elapsed time per rendered frame (it has
+# no fixed 1/30s timestep constant), so the rendered frame rate is exactly
+# half the report rate:
+#   120 -> 60 FPS at 1x speed (default)
+#    60 -> 30 FPS at 1x speed
+# If gameplay ever measures fast at 120 (audio/gameplay running too quickly),
+# drop this to 60.
+vsync_hz=120
+
+
 [input]
 
 # Gamepad support. Limbo takes input through the native AInputQueue rather than
