@@ -1,5 +1,6 @@
 #include "cocos2dx.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -129,9 +130,61 @@ std::shared_ptr<FakeJni::JString> jnivm::org::cocos2dx::lib::Cocos2dxHelper::get
     return std::make_shared<FakeJni::JString>("en");
 }
 
+// A stable per-install anonymous device ID, generated once and persisted --
+// same approach gdash_nx uses on the Switch (there via the hardware RNG;
+// here via /dev/urandom). The game sends this with its server requests; a
+// fixed "0" for every install/session is at best a minor server-side
+// annoyance and at worst something the server could use to conflate
+// unrelated players.
+static bool valid_device_id(const char *s)
+{
+    if (strlen(s) != 16)
+        return false;
+    bool any_nonzero = false;
+    for (int i = 0; i < 16; i++)
+    {
+        if (!isxdigit((unsigned char)s[i]))
+            return false;
+        any_nonzero |= s[i] != '0';
+    }
+    return any_nonzero;
+}
+
 std::shared_ptr<FakeJni::JString> jnivm::org::cocos2dx::lib::Cocos2dxHelper::getUserID()
 {
-    return std::make_shared<FakeJni::JString>("0");
+    static std::string id;
+    if (!id.empty())
+        return std::make_shared<FakeJni::JString>(id);
+
+    const char *saved = prefs_get("__gdash_device_id", "");
+    if (valid_device_id(saved))
+    {
+        id = saved;
+        return std::make_shared<FakeJni::JString>(id);
+    }
+
+    // A short read (or no /dev/urandom at all) just leaves some/all of
+    // random[] zeroed; valid_device_id()'s any_nonzero check below catches a
+    // fully-zeroed result and falls back to the fixed placeholder ID.
+    unsigned char random[8] = {0};
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f)
+    {
+        size_t got = fread(random, 1, sizeof(random), f);
+        (void)got;
+        fclose(f);
+    }
+    static const char hex[] = "0123456789abcdef";
+    char buf[17];
+    for (int i = 0; i < 8; i++)
+    {
+        buf[i * 2] = hex[random[i] >> 4];
+        buf[i * 2 + 1] = hex[random[i] & 15];
+    }
+    buf[16] = '\0';
+    id = valid_device_id(buf) ? buf : "0123456789abcdef";
+    prefs_set_raw("__gdash_device_id", id.c_str());
+    return std::make_shared<FakeJni::JString>(id);
 }
 
 std::shared_ptr<FakeJni::JString> jnivm::org::cocos2dx::lib::Cocos2dxHelper::getStringForKey(std::shared_ptr<FakeJni::JString> key, std::shared_ptr<FakeJni::JString> def)

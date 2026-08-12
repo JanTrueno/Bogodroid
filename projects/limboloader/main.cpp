@@ -340,8 +340,24 @@ int main(int argc, char *argv[])
     // width -- with no hardcoded replacement number of our own, so it keeps
     // tracking whatever size we report via config/ANativeWindow forever.
     //
-    uint8_t *csel_cond_byte = (uint8_t *)(lmain.base + 0x241cb9);
-    if (*csel_cond_byte == 0xb1)
+    // Different builds of libLimbo.so (Play Store vs Epic Games Store, etc.)
+    // compile this to different addresses -- each entry here is the same
+    // csel's condition byte in one known build. Try each until one matches.
+    static const uintptr_t backbuffer_cap_offsets[] = {
+        0x241cb9, // Play Store build (SM8250/Adreno device)
+        0x229bcd, // Epic Games Store build (RK3566/Mali device)
+    };
+    uint8_t *csel_cond_byte = nullptr;
+    for (uintptr_t off : backbuffer_cap_offsets)
+    {
+        uint8_t *candidate = (uint8_t *)(lmain.base + off);
+        if (*candidate == 0xb1)
+        {
+            csel_cond_byte = candidate;
+            break;
+        }
+    }
+    if (csel_cond_byte)
     {
         *csel_cond_byte = 0xe1;
         __builtin___clear_cache((char *)csel_cond_byte, (char *)csel_cond_byte + 1);
@@ -349,9 +365,8 @@ int main(int argc, char *argv[])
     }
     else
     {
-        printf("[patch] WARNING: backbuffer-cap patch site does not match expected bytes "
-               "(got 0x%02x, expected 0xb1) -- skipping; game will render at a fixed low resolution\n",
-               *csel_cond_byte);
+        printf("[patch] WARNING: backbuffer-cap patch site not found in any known build "
+               "-- skipping; game will render at a fixed low resolution\n");
     }
 
     FakeJni::LocalFrame frame(vm);
@@ -433,13 +448,13 @@ int main(int argc, char *argv[])
             ? activity->getClassInternal(activityEnv)->getName().c_str()
             : "(none)");
 
-    // The engine writes saves/unpacked assets here; keep them beside the game
-    // files rather than in the host's home dir.
+    // Just valid-looking paths for the ANativeActivity struct fields -- Limbo
+    // doesn't actually read or write through them (its real save state goes
+    // through the SaveGame_* JNI stubs in javastubs/limbo.cpp instead, next
+    // to the binary), so there's nothing to create on disk here.
     static std::string internalPath = std::filesystem::absolute("files").string();
     static std::string externalPath = std::filesystem::absolute("files").string();
     static std::string obbPath = std::filesystem::absolute("obb").string();
-    std::filesystem::create_directories(internalPath);
-    std::filesystem::create_directories(obbPath);
 
     nActivity.internalDataPath = internalPath.c_str();
     nActivity.externalDataPath = externalPath.c_str();
@@ -840,29 +855,14 @@ int main(int argc, char *argv[])
         const int64_t frameTimeNanos =
             std::chrono::duration_cast<std::chrono::nanoseconds>(now - startTime).count();
 
-        // Re-report the playability / services gates once a second, capped at
-        // a handful of attempts.
-        //
-        // On Android these arrive from Java whenever the licence check and Play
-        // Games sign-in resolve, which is *after* the activity is up -- so the
-        // engine starts waiting for them and is told later. Reporting only once
-        // at startup races that: if the game thread begins waiting after our
-        // single call, the report is lost and it waits forever, which looks
-        // exactly like a stuck title screen with no audio (gameplay never
-        // resumes, so neither does sound).
-        //
-        // These are NOT harmless fire-and-forget setters, though: the engine
-        // treats every call as a fresh "just became playable" transition and
-        // redoes first-time setup around it, including tearing down and
-        // recreating its whole OpenSL audio engine (confirmed: slCreateEngine/
-        // CreateOutputMix/Realize repeating in lockstep with these calls), which
-        // also resets whatever clock baseline it times animation/audio playback
-        // against -- that's what was making the game run and sound sped up.
-        // A time-boxed window (e.g. "first 10 seconds") still fires several
-        // times during actual gameplay, since loading finishes in ~1-3s per the
-        // logs. Capping the attempt *count* instead means it always stops
-        // shortly after startup regardless of load time, while still covering
-        // the race the repeats exist for in the first place.
+        // Re-report playability/services once a second, capped at 3 attempts:
+        // on Android these arrive from Java after license/sign-in resolve,
+        // which can be after the engine starts waiting, so a single report at
+        // startup can race and be missed (stuck title screen, no audio).
+        // Each call is treated as a fresh "just became playable" transition
+        // though -- it recreates the OpenSL engine and resets the animation/
+        // audio clock baseline -- so repeats must stop once the race window
+        // has passed, not run for the whole session.
         {
             static int attemptsLeft = 3;
             static int64_t lastGateNs = 0;
@@ -877,68 +877,34 @@ int main(int argc, char *argv[])
             }
         }
 
-        // Stands in for the Choreographer frame callback that drives the game.
+        // Stands in for the Choreographer frame callback that drives the
+        // game. Without it, reportVSync would fire uncapped (500-1000+/s) --
+        // the only other throttle in this loop is the 1ms SDL_Delay below.
         //
-        // This loop's only other throttle is a 1ms SDL_Delay below, so without
-        // this, reportVSync fires once per iteration -- 500-1000+ times a
-        // second, uncapped.
+        // The engine only signals its render thread on every OTHER call at a
+        // normal (<=20ms) cadence; the rest just update bookkeeping. So a
+        // report rate of N Hz yields N/2 rendered frames/s. It measures real
+        // elapsed time per rendered frame itself (no fixed 1/30s timestep
+        // constant), so that should hold at 1x speed for any N -- confirmed
+        // true at 60 (30 FPS). 120 (60 FPS) measures the FPS counter right
+        // but still runs gameplay at 2x speed, not yet root-caused (possibly
+        // the engine's own adaptive "OnVSyncEvent ... adjusting to NHz
+        // display" logic misreading the rate) -- so [video] vsync_hz stays
+        // at 60 until that's understood.
         //
-        // Confirmed by decompiling Java_com_playdead_limbo_LimboActivity_
-        // native_1ReportVSyncCallEvent: on every call where the delta since
-        // the previous call is a normal cadence (<=20ms), the engine only
-        // actually signals its render thread on every OTHER call -- the rest
-        // just update bookkeeping and return (the "last == prev-prev" skip;
-        // only [last] is re-stored on skipped calls, so [prev] trails one
-        // report behind and the skip toggles every call). On a 30Hz-display
-        // cadence (20-50ms delta, "adjusting to 30Hz display") it signals
-        // every call. So:
-        //
-        //   60Hz reports -> 30 signals/s -> 30 rendered frames/s, and every
-        //   rendered frame measures the real elapsed time (~33ms) via
-        //   clock_gettime (the engine has no fixed 1/30s timestep constant
-        //   anywhere -- no 0.033333f/double, no 33333333ns -- frame time is
-        //   measured per frame and clamped to [~1us, 100ms]), so simulation
-        //   runs at exactly 1x speed.
-        //
-        //   120Hz reports -> 60 signals/s -> 60 rendered frames/s at ~16.7ms
-        //   measured per frame -> 1x speed at 60 FPS.
-        //
-        // The older note in this spot claimed 120Hz runs the sim at 2x speed
-        // ("the engine still assumes 33ms passed") -- that observation was
-        // made before the reportIsPlayable/reportGameServices repeat-call fix
-        // below, whose engine-side side effect (tearing down and recreating
-        // the OpenSL audio engine and resetting the animation clock baseline)
-        // is what actually sped the game up. Nothing in libLimbo.so fixes the
-        // sim timestep to 1/30, so 120Hz reports are safe to try; if gameplay
-        // ever measures fast, drop back to 1'000'000'000LL / 60.
-        //
-        // The previous implementation reset lastVsyncNs to the *check* time
-        // on each fire, so every SDL_Delay(1) poll's 1-2ms latency
-        // accumulated and reports came out at ~57-58Hz -- the engine's
-        // every-other-frame rule turned that into ~28.5 FPS. The deadline is
-        // now advanced by a fixed interval instead, so the report cadence is
-        // exact regardless of how late the poll runs, and any backlog (a
-        // stall >8.3ms) is flushed with on-time deltas so the engine never
-        // sees a "slow vsync" it might react to.
-        //
-        // [video] vsync_hz selects the report rate: 120 -> 60 FPS, 60 ->
-        // 30 FPS (see above). Defaults to 120.
+        // The deadline advances by a fixed interval rather than resetting to
+        // the check time, so the report cadence is exact regardless of how
+        // late a given SDL_Delay(1) poll lands; any backlog is flushed with
+        // on-time deltas so the engine never sees a spurious "slow vsync".
         {
             static const int64_t vsyncIntervalNs =
-                1'000'000'000LL / config["video"]["vsync_hz"].value_or<int>(120);
+                1'000'000'000LL / config["video"]["vsync_hz"].value_or<int>(60);
             static int64_t nextVsyncNs = -1;
             static int64_t lastCheckNs = 0;
             static bool haveLast = false;
 
-            // Logged regardless of whether we're about to fire: a stall here
-            // is on our side (we're being called from the SDL_Delay(1) loop,
-            // so a >20ms gap since the last check is jitter/a stall, not
-            // normal). The engine logs its own "AndroidApp::OnVSyncEvent:
-            // vsync delta was X" when IT decides a delta means the display
-            // changed rate (sometimes adopting X as the new target, e.g.
-            // "adjusting to 30Hz display") -- this tells us whether a bad
-            // delta the engine reacts to originates on our side or entirely
-            // inside the engine's own handling of an on-time call.
+            // A >20ms gap here is a stall in our own loop (we're driven by
+            // the SDL_Delay(1) below), not the engine's concern.
             if (haveLast && frameTimeNanos - lastCheckNs > 20'000'000LL)
                 printf("[vsync] %lld ns (%.1fms) since last check -- stall in our own loop\n",
                     (long long)(frameTimeNanos - lastCheckNs),

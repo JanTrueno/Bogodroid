@@ -32,7 +32,6 @@ mainIntentBundle = {}
 # into only part of the screen even though the window itself was fullscreen.
 displayWidth=1920
 displayHeight=1080
-displayRotation=0
 fullscreen=true
 
 # AConfiguration_getTouchscreen: 1 = NOTOUCH, 2 = STYLUS, 3 = FINGER.
@@ -59,12 +58,15 @@ country="US"
 # The engine signals its render thread on every OTHER report at a normal
 # <=20ms cadence, and measures real elapsed time per rendered frame (it has
 # no fixed 1/30s timestep constant), so the rendered frame rate is exactly
-# half the report rate:
-#   120 -> 60 FPS at 1x speed (default)
-#    60 -> 30 FPS at 1x speed
-# If gameplay ever measures fast at 120 (audio/gameplay running too quickly),
-# drop this to 60.
-vsync_hz=120
+# half the report rate: 60 -> 30 FPS.
+#
+# 120 (60 FPS) was tried but runs gameplay at 2x speed despite the FPS
+# counter reading correctly -- the render/report cadence logic behaves
+# exactly as documented, but something else (likely the engine's own
+# adaptive OnVSyncEvent "adjusting to NHz display" logic misdetecting the
+# rate) throws off its internal timing at that setting. Not yet root-caused;
+# staying at the known-good 60/30 until it is.
+vsync_hz=60
 
 
 [input]

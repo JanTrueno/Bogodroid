@@ -74,7 +74,11 @@ void segfault_handler_si(int signal, siginfo_t *si, void *ctx) {
 
 void exit_handler(int signal) {
     printf("Caught signal %d, exiting...\n", signal);
-    exit(0);
+    // exit(0) runs every atexit handler and static destructor process-wide
+    // (SDL, audio threads, GPU/EGL teardown, the JNI shim...) before actually
+    // terminating -- if any of those is slow or hangs, a plain kill/pkill
+    // just sits there instead of exiting. _exit() skips all that.
+    _exit(0);
 }
 
 void print_backtrace_on_segfault()

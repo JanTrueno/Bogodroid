@@ -22,4 +22,14 @@ void gdash_network_init(bool enabled, int connect_timeout_ms);
 // loaded and relocated; the import-table hooks tail into them)
 void fmod_hooks_init(so_module *fmod_mod);
 
+// Server-side compatibility, ported from gdash_nx's game_compat.c (as opposed
+// to the networking on/off switch in gdash_network_init): libcurl TLS
+// verification + CA bundle, an online-level metadata parser crash, and a
+// public-leaderboard bootstrap bug. All three patch the game's own machine
+// code -- libcocos2dcpp.so is the same Android build on both ports, so the
+// byte patterns carry over -- and each is a no-op if its pattern isn't found.
+// Call once after the module is loaded and relocated, but before
+// so_initialize() runs its constructors.
+void gdash_server_compat_init(so_module *game_mod);
+
 #endif

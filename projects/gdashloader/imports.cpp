@@ -56,6 +56,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <arpa/inet.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <poll.h>
@@ -113,9 +114,67 @@ static int *errno_gd() { return &errno; }
 static char fixbuf[4][PATH_MAX];
 static int fixidx = 0;
 
+// ---------------------------------------------------------------------------
+// TLS CA bundle: the game's embedded OpenSSL (1.1.0c) was built on the
+// original developer's machine and retained that machine's absolute
+// OPENSSLDIR, so its default CA lookup always misses on any other system.
+// gdash_nx hits the exact same issue on the Switch -- which has no such path
+// at all -- and fixes it by exporting Horizon's own trust store to a file and
+// redirecting the hardcoded lookup onto it. On Linux there's usually nothing
+// to export: the hardcoded path already matches where a real CA bundle
+// normally lives, so just point at whichever one actually exists here.
+// ---------------------------------------------------------------------------
+
+static const char *ca_bundle_path() {
+  static const char *candidates[] = {
+    "/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu and derivatives
+    "/etc/ssl/cert.pem",                  // Alpine and some embedded distros
+    "/etc/pki/tls/certs/ca-bundle.crt",   // Fedora/RHEL family
+    "/etc/ca-certificates/ca-bundle.crt",
+  };
+  static const char *resolved = nullptr;
+  static bool checked = false;
+  if (!checked) {
+    checked = true;
+    for (const char *c : candidates) {
+      struct stat st;
+      if (stat(c, &st) == 0 && st.st_size > 0) {
+        resolved = c;
+        break;
+      }
+    }
+    if (resolved)
+      printf("[gdash] TLS CA bundle: %s\n", resolved);
+    else
+      printf("[gdash] TLS CA bundle: none of the usual system paths exist -- "
+             "HTTPS certificate verification will stay disabled\n");
+  }
+  return resolved;
+}
+
 static const char *fix_path(const char *path) {
   if (!path)
     return path;
+
+  // The game's embedded OpenSSL fopen()s one of these exact suffixes looking
+  // for its build-machine CA bundle; redirect to whichever real one exists on
+  // this system (same suffix set gdash_nx matches on the Switch).
+  static const char *ca_suffixes[] = {
+    "/ssl/cert.pem",
+    "/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/certs/ca-certificates.crt",
+  };
+  const size_t path_len = strlen(path);
+  for (const char *suffix : ca_suffixes) {
+    const size_t suffix_len = strlen(suffix);
+    if (path_len >= suffix_len &&
+        strcmp(path + path_len - suffix_len, suffix) == 0) {
+      const char *real = ca_bundle_path();
+      return real ? real : path;
+    }
+  }
+
   const size_t prefix_len = sizeof(ANDROID_DATA_PREFIX) - 1;
   if (strncmp(path, ANDROID_DATA_PREFIX, prefix_len) != 0)
     return path;
@@ -621,6 +680,85 @@ static int getpeername_none(int fd, void *addr, unsigned *addrlen) {
 
 static int g_connect_timeout_ms = 4000;
 
+static int socket_gd(int domain, int type, int protocol) {
+    // Devices whose kernel has no IPv6 at all (no /proc/sys/net/ipv6 -- not
+    // disabled, never built in) fail a real AF_INET6 socket() with
+    // EAFNOSUPPORT, and the game treats that capability probe as fatal for
+    // the request rather than falling back to IPv4. Hand back an AF_INET
+    // socket so the probe succeeds; getaddrinfo_gd() already guarantees no
+    // IPv6 address ever reaches curl, so nothing tries to connect it.
+    if (domain == AF_INET6)
+        domain = AF_INET;
+    int fd = socket(domain, type, protocol);
+    if (fd < 0)
+        printf("[gdash] socket(domain=%d, type=%d) failed: %s\n", domain, type, strerror(errno));
+    return fd;
+}
+
+// glibc lays out struct addrinfo as {..., ai_addr, ai_canonname, ai_next};
+// bionic, like the BSD headers it derives from, uses {..., ai_canonname,
+// ai_addr, ai_next}. Identical size, identical offsets for every other field
+// -- only those two pointers trade places, so one in-place swap converts a
+// chain between the two ABIs (and the swap is its own inverse).
+//
+// The game's curl was compiled against bionic, so it reads a raw glibc result
+// with those two fields transposed: it takes ai_canonname (NULL, since we
+// never pass AI_CANONNAME) as the address. Every resolved entry therefore
+// looks addressless, curl finds nothing to connect to, and abandons the
+// request without ever calling socket() or connect() -- the exact "DNS
+// resolves fine, nothing ever goes out" symptom. gdash_nx never hit this
+// because libnx/newlib is BSD-ordered too, matching bionic.
+static void addrinfo_bionic_swap(struct addrinfo *ai) {
+    for (; ai; ai = ai->ai_next) {
+        char *canonname = ai->ai_canonname;
+        ai->ai_canonname = (char *)ai->ai_addr;
+        ai->ai_addr = (struct sockaddr *)canonname;
+    }
+}
+
+// glibc's freeaddrinfo must see its own layout again, so undo the swap first.
+static void freeaddrinfo_gd(struct addrinfo *res) {
+    if (!res)
+        return;
+    addrinfo_bionic_swap(res);
+    freeaddrinfo(res);
+}
+
+static int getaddrinfo_gd(const char *node, const char *service, const struct addrinfo *hints,
+                           struct addrinfo **res) {
+    // Force IPv4-only: some of these devices have no IPv6 in the kernel at
+    // all, and an IPv6 result the game then can't create a socket for stalls
+    // the request (see socket_gd).
+    struct addrinfo forced_hints;
+    if (hints && hints->ai_family == AF_UNSPEC) {
+        forced_hints = *hints;
+        forced_hints.ai_family = AF_INET;
+        hints = &forced_hints;
+    } else if (!hints) {
+        memset(&forced_hints, 0, sizeof(forced_hints));
+        forced_hints.ai_family = AF_INET;
+        hints = &forced_hints;
+    }
+
+    // Retry transient resolver failures. On wifi these devices intermittently
+    // lose a DNS query and glibc reports EAI_NONAME/EAI_AGAIN for a host that
+    // resolves fine moments later; the game turns that single miss into a
+    // visible "download failed" even though it would succeed on its own retry.
+    // Only failures pay the delay, and only for the two retryable codes.
+    int r = getaddrinfo(node, service, hints, res);
+    for (int attempt = 0; r != 0 && attempt < 2 && (r == EAI_NONAME || r == EAI_AGAIN); attempt++) {
+        usleep(150 * 1000);
+        r = getaddrinfo(node, service, hints, res);
+    }
+
+    if (r != 0)
+        printf("[gdash] getaddrinfo(%s:%s) failed: %s\n",
+            node ? node : "(null)", service ? service : "(null)", gai_strerror(r));
+    else if (res && *res)
+        addrinfo_bionic_swap(*res); // hand the game a bionic-shaped chain
+    return r;
+}
+
 static int connect_gd(int fd, const struct sockaddr *addr, socklen_t addrlen) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0 && !(flags & O_NONBLOCK))
@@ -645,13 +783,23 @@ static int connect_gd(int fd, const struct sockaddr *addr, socklen_t addrlen) {
     }
     if (flags >= 0)
         fcntl(fd, F_SETFL, flags); // restore blocking mode either way
+    if (r != 0) {
+        char dest[64] = "?";
+        if (addr && addr->sa_family == AF_INET) {
+            const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
+            char ip[INET_ADDRSTRLEN] = "?";
+            inet_ntop(AF_INET, &in->sin_addr, ip, sizeof(ip));
+            snprintf(dest, sizeof(dest), "%s:%u", ip, ntohs(in->sin_port));
+        }
+        printf("[gdash] connect(%s) failed: %s\n", dest, strerror(errno));
+    }
     return r;
 }
 
 struct NetSym { const char *symbol; uintptr_t stub; uintptr_t real; };
 
 static const NetSym g_net_syms[] = {
-    { "socket",          (uintptr_t)&socket_none,          (uintptr_t)&socket },
+    { "socket",          (uintptr_t)&socket_none,          (uintptr_t)&socket_gd },
     { "connect",         (uintptr_t)&connect_none,         (uintptr_t)&connect_gd },
     { "send",            (uintptr_t)&send_none,            (uintptr_t)&send },
     { "recv",            (uintptr_t)&recv_none,            (uintptr_t)&recv },
@@ -664,8 +812,8 @@ static const NetSym g_net_syms[] = {
     { "getpeername",     (uintptr_t)&getpeername_none,     (uintptr_t)&getpeername },
     { "getsockname",     (uintptr_t)&getsockname_none,     (uintptr_t)&getsockname },
     { "socketpair",      (uintptr_t)&socketpair_none,      (uintptr_t)&socketpair },
-    { "getaddrinfo",     (uintptr_t)&getaddrinfo_none,     (uintptr_t)&getaddrinfo },
-    { "freeaddrinfo",    (uintptr_t)&freeaddrinfo_none,    (uintptr_t)&freeaddrinfo },
+    { "getaddrinfo",     (uintptr_t)&getaddrinfo_none,     (uintptr_t)&getaddrinfo_gd },
+    { "freeaddrinfo",    (uintptr_t)&freeaddrinfo_none,    (uintptr_t)&freeaddrinfo_gd },
     { "getnameinfo",     (uintptr_t)&getnameinfo_none,     (uintptr_t)&getnameinfo },
     { "gethostbyname",   (uintptr_t)&gethostbyname_none,   (uintptr_t)&gethostbyname },
     { "gethostbyname_r", (uintptr_t)&gethostbyname_r_none, (uintptr_t)&gethostbyname_r },
@@ -858,3 +1006,208 @@ DynLibFunction symtable_gdash[] = {
 
   { NULL, (uintptr_t)NULL }
 };
+
+// ---------------------------------------------------------------------------
+// server compat: ported from gdash_nx's game_compat.c. These patches target
+// the game's own compiled machine code in libcocos2dcpp.so -- the same
+// original Android build on both ports, since neither recompiles it -- so
+// the same byte patterns apply here unmodified. Each is independently
+// no-op-safe if its pattern isn't found (logs and moves on, same principle
+// as the Limbo backbuffer-cap patch).
+// ---------------------------------------------------------------------------
+
+static int hex_digit_value(unsigned char digit) {
+  if (digit >= '0' && digit <= '9') return digit - '0';
+  if (digit >= 'A' && digit <= 'F') return digit - 'A' + 10;
+  if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+  return -1;
+}
+
+// Geometry Dash 2.2.147's ZipUtils::hexToChar uses a C++ stringstream for
+// each percent-escaped byte in online-level song metadata. Its cached
+// std::ctype table isn't compatible with this runtime and crashes -- a
+// general old-GNU-string-ABI-vs-runtime-std::ctype mismatch, not anything
+// Switch-specific. The affected build uses the old GNU std::string ABI: a
+// const reference points to an object whose first word is the character
+// data pointer.
+static unsigned char hex_to_char_compat(const void *string_ref) {
+  if (!string_ref)
+    return 0;
+  const unsigned char *data = nullptr;
+  memcpy(&data, string_ref, sizeof(data));
+  if (!data)
+    return 0;
+  const int high = hex_digit_value(data[0]);
+  if (high < 0)
+    return 0;
+  const int low = hex_digit_value(data[1]);
+  if (low < 0)
+    return (unsigned char)high;
+  return (unsigned char)((high << 4) | low);
+}
+
+static void patch_url_decoder(so_module *mod) {
+  uintptr_t address = so_symbol(mod, "_ZN7cocos2d8ZipUtils9hexToCharERKSs");
+  if (!address) {
+    printf("[gdash] hexToChar symbol not found -- online-level metadata "
+           "parsing may crash on percent-escaped bytes\n");
+    return;
+  }
+  hook_address(mod, address, (uintptr_t)&hex_to_char_compat);
+  printf("[gdash] patched ZipUtils::hexToChar (online-level metadata crash fix)\n");
+}
+
+// On a fresh/anonymous profile the stock client tries updateUserScore()
+// before its first getGJScores20 request. Boomlings rejects that upload
+// without an account, and the failure callback never starts the public
+// leaderboard download. Skip only that decision branch; the existing path
+// immediately below still performs the normal cached/network lookup.
+static void patch_leaderboard_bootstrap(so_module *mod) {
+  uintptr_t address = so_symbol(mod,
+      "_ZN17LeaderboardsLayer17selectLeaderboardE15LeaderboardType15LeaderboardStat");
+  if (!address) {
+    printf("[gdash] LeaderboardsLayer::selectLeaderboard symbol not found -- "
+           "skipping fresh-profile leaderboard fix\n");
+    return;
+  }
+
+  uint32_t *code = (uint32_t *)address;
+  const uint32_t ldrb_score_uploaded = 0x3948a000u; // ldrb w0, [x0, #552]
+  const uint32_t cbz_w0_mask = 0x7f00001fu;
+  const uint32_t cbz_w0 = 0x34000000u;
+  const uint32_t nop = 0xd503201fu;
+  for (unsigned i = 0; i + 1 < 96; i++) {
+    if (code[i] != ldrb_score_uploaded ||
+        (code[i + 1] & cbz_w0_mask) != cbz_w0)
+      continue;
+    code[i + 1] = nop;
+    printf("[gdash] patched public-leaderboard bootstrap (fresh-profile fix)\n");
+    return;
+  }
+  printf("[gdash] leaderboard-bootstrap patch site not found -- fresh profiles "
+         "may not see public leaderboards until they submit a score\n");
+}
+
+static int is_bl_gd(uint32_t instruction) {
+  return (instruction & 0xfc000000u) == 0x94000000u;
+}
+
+static uintptr_t bl_target_gd(uintptr_t pc, uint32_t instruction) {
+  int64_t immediate = instruction & 0x03ffffffu;
+  if (immediate & 0x02000000)
+    immediate -= 0x04000000;
+  return (uintptr_t)((int64_t)pc + immediate * 4);
+}
+
+// CCHttpClient sets libcurl options 64 (SSL_VERIFYPEER) and 81
+// (SSL_VERIFYHOST) to zero in every supported GD variant's arm64 build, and
+// never sets CURLOPT_CAINFO -- meaning HTTPS requests already work (Boomlings
+// doesn't require client certs), just without verifying the server's
+// certificate at all. This replaces that with real verification pointed at a
+// real CA bundle: matches the complete option sequence and shared
+// curl_easy_setopt call target (both must resolve to the very same function)
+// to stay constrained to this specific routine, then replaces the
+// nonessential TCP-keepalive/DNS-cache-timeout setters with one CAINFO
+// setter -- an 8-instruction slot, using a literal load so the CA path can
+// live anywhere in the module's address space, with a branch that jumps over
+// the embedded 64-bit pointer into the original epilogue. Ported as-is from
+// gdash_nx's game_compat.c, which validated this exact byte sequence across
+// every supported GD variant.
+static void patch_curl_tls_verify(so_module *mod) {
+  const char *ca_path_str = ca_bundle_path();
+  if (!ca_path_str)
+    return; // no valid system CA bundle; leave verification off rather than
+            // point curl at a path that would just fail every request
+
+  const uint32_t mov_x0_x19 = 0xaa1303e0u;
+  const uint32_t mov_w1_verify_peer = 0x52800801u; // mov w1, #64
+  const uint32_t mov_w1_verify_host = 0x52800a21u; // mov w1, #81
+  const uint32_t mov_w1_tcp_keepalive = 0x52801aa1u; // mov w1, #213
+  const uint32_t mov_w1_dns_cache_timeout = 0x52800b81u; // mov w1, #92
+  const uint32_t mov_w1_cainfo = 0x5284ea21u; // mov w1, #10065
+  const uint32_t mov_x2_zero = 0xd2800002u;
+  const uint32_t mov_x2_one = 0xd2800022u;
+  const uint32_t mov_x2_two = 0xd2800042u;
+  const uint32_t mov_x2_sixty = 0xd2800782u;
+  const uint32_t ldr_x2_literal_16 = 0x58000082u; // ldr x2, PC + 16
+  const uint32_t branch_forward_16 = 0x14000004u; // b PC + 16
+  const uint32_t nop = 0xd503201fu;
+  const uintptr_t ca_path = (uintptr_t)ca_path_str;
+  int patched = 0;
+
+  // Scan every executable PT_LOAD segment. Don't take so_module's
+  // text_base/text_size as a shortcut for "the .text segment" -- those track
+  // this loader's own patch/code-cave arena (see the struct comment in
+  // so_util.h), not the guest's code.
+  for (int seg = 0; seg < mod->ehdr->e_phnum; seg++) {
+    const Elf_Phdr *p = &mod->phdr[seg];
+    if (p->p_type != PT_LOAD || !(p->p_flags & PF_X) || p->p_filesz < 24)
+      continue;
+    // p_vaddr is already the absolute runtime address here (so_load()
+    // normalizes it; segment 0's p_vaddr == mod->base), not the file-relative
+    // offset most PIE ELFs use. Adding mod->base again lands at 2x base, in
+    // unmapped memory.
+    uint32_t *code = (uint32_t *)(uintptr_t)p->p_vaddr;
+    // Guard in case that ever stops holding: skip rather than deref a wild
+    // pointer.
+    if ((uintptr_t)code < mod->base || (uintptr_t)code > mod->base + 0x10000000) {
+      printf("[gdash] TLS patch: segment %d code=%p looks wrong "
+             "(mod->base=%p) -- skipping\n", seg, (void *)code, (void *)mod->base);
+      continue;
+    }
+    const size_t words = p->p_filesz / sizeof(*code);
+    for (size_t i = 0; i + 5 < words; i++) {
+      if (code[i] != mov_w1_verify_peer || code[i + 1] != mov_x2_zero ||
+          !is_bl_gd(code[i + 2]))
+        continue;
+      const uintptr_t peer_target =
+          bl_target_gd((uintptr_t)&code[i + 2], code[i + 2]);
+      const size_t limit = i + 12 < words ? i + 12 : words - 2;
+      for (size_t j = i + 3; j < limit; j++) {
+        if (code[j] != mov_w1_verify_host || code[j + 1] != mov_x2_zero ||
+            !is_bl_gd(code[j + 2]))
+          continue;
+        if (bl_target_gd((uintptr_t)&code[j + 2], code[j + 2]) != peer_target)
+          continue;
+
+        for (size_t k = j + 3; k < j + 24 && k + 7 < words; k++) {
+          if (code[k] != mov_x0_x19 ||
+              code[k + 1] != mov_w1_tcp_keepalive ||
+              code[k + 2] != mov_x2_one || !is_bl_gd(code[k + 3]) ||
+              code[k + 4] != mov_x0_x19 ||
+              code[k + 5] != mov_w1_dns_cache_timeout ||
+              code[k + 6] != mov_x2_sixty || !is_bl_gd(code[k + 7]))
+            continue;
+          if (bl_target_gd((uintptr_t)&code[k + 3], code[k + 3]) != peer_target ||
+              bl_target_gd((uintptr_t)&code[k + 7], code[k + 7]) != peer_target)
+            continue;
+
+          code[i + 1] = mov_x2_one;
+          code[j + 1] = mov_x2_two;
+          code[k + 1] = mov_w1_cainfo;
+          code[k + 2] = ldr_x2_literal_16;
+          // code[k + 3] remains the original curl_easy_setopt BL.
+          code[k + 4] = branch_forward_16;
+          code[k + 5] = nop;
+          memcpy(&code[k + 6], &ca_path, sizeof(ca_path));
+          patched++;
+          break;
+        }
+        break;
+      }
+    }
+  }
+
+  if (patched)
+    printf("[gdash] enabled TLS certificate verification (%d site%s), CAINFO=%s\n",
+        patched, patched == 1 ? "" : "s", ca_path_str);
+  else
+    printf("[gdash] TLS verification patch site not found -- HTTPS requests "
+           "will work but without certificate verification\n");
+}
+
+void gdash_server_compat_init(so_module *game_mod) {
+  patch_url_decoder(game_mod);
+  patch_leaderboard_bootstrap(game_mod);
+  patch_curl_tls_verify(game_mod);
+}

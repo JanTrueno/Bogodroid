@@ -180,8 +180,31 @@ EGLBoolean eglSwapBuffers_impl(EGLDisplay display,
     }
 
     static auto real_swap_buffers = (EGLBoolean (*)(EGLDisplay, EGLSurface))getProc("eglSwapBuffers");
+    static auto real_get_current_context = (EGLContext (*)())getProc("eglGetCurrentContext");
     if (real_swap_buffers)
-        real_swap_buffers(display, surface == FAKE_PBUFFER_SURFACE ? EGL_NO_SURFACE : surface);
+    {
+        EGLSurface swap_surface = surface == FAKE_PBUFFER_SURFACE ? EGL_NO_SURFACE : surface;
+        if (swap_surface == egl_surface)
+        {
+            // Route the real window surface through SDL_GL_SwapWindow rather
+            // than a raw eglSwapBuffers: on KMSDRM without a compositor the
+            // raw call reports success (the GL-level swap does happen) but
+            // nothing reaches the screen -- SDL's KMSDRM backend does an extra
+            // DRM page-flip inside SwapWindow that eglSwapBuffers doesn't.
+            // SDL picks the context from its own bookkeeping, which only
+            // SDL_GL_MakeCurrent updates, so sync that to whatever is actually
+            // current here first (it is already bound at the EGL level; this
+            // only corrects SDL's tracking).
+            EGLContext real_current = real_get_current_context ? real_get_current_context() : nullptr;
+            if (real_current)
+                SDL_GL_MakeCurrent(sdl_win, (SDL_GLContext)real_current);
+            SDL_GL_SwapWindow(sdl_win);
+        }
+        else
+        {
+            real_swap_buffers(display, swap_surface);
+        }
+    }
 
     using namespace std::chrono;
 
@@ -376,6 +399,25 @@ EGLDisplay eglGetDisplay_impl(NativeDisplayType native_display)
     SDL_GL_SwapWindow(sdl_win);
     SDL_GL_SwapWindow(sdl_win);
 
+    // Re-capture after those swaps rather than once before them: SDL's GBM/DRM
+    // backend reallocates its buffer object on swap, so a handle cached
+    // earlier is dead (EGL_BAD_SURFACE) for the rest of the run. Harmless on
+    // backends that don't do this -- same handle either way.
+    egl_display = ((EGLDisplay (*)())getProc("eglGetCurrentDisplay"))();
+    egl_context = ((EGLContext (*)())getProc("eglGetCurrentContext"))();
+    egl_surface = ((EGLSurface (*)(EGLint))getProc("eglGetCurrentSurface"))(EGL_DRAW);
+    printf("[egl] display=%p context=%p surface=%p\n", egl_display, egl_context, egl_surface);
+
+    // Release this thread's claim on egl_surface: a surface can only be
+    // current in one context at a time, and the SDL_GL_MakeCurrent above
+    // never gave it back. Without this the engine's own render thread can
+    // never bind to the window surface -- eglMakeCurrent fails every frame
+    // and nothing is ever presented (black screen, no other symptom). The
+    // game thread renders to its own offscreen surface, so this costs it
+    // nothing.
+    ((EGLBoolean (*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext))getProc("eglMakeCurrent"))(
+        egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
     return egl_display;
 }
 
@@ -483,21 +525,20 @@ EGLSurface eglCreateWindowSurface_impl(EGLDisplay display, EGLConfig config, Nat
 #ifdef FAKE_EGL
     return (EGLSurface)0xDEAD;
 #endif
-    // Log the real, driver-reported size of the surface we're handing back --
-    // this is what the compositor will actually present, as opposed to
-    // whatever size we've told the game its ANativeWindow is (see
-    // ANativeWindow_getWidth/Height in thunks/ndk/ndk.cpp) or what the game
-    // computes as its internal render/backbuffer size. Comparing these three
-    // is the way to tell whether a scaling mismatch is us reporting the wrong
-    // window size, or the game's own upscale-to-window step not doing what it
-    // should with a correct one.
+    // Log the driver's real surface size -- what actually gets presented, as
+    // opposed to the size we report as the ANativeWindow (ndk.cpp) or what the
+    // game picks for its backbuffer. Comparing the three tells you whether a
+    // scaling mismatch is our reported window size or the game's own upscale.
+    // Query with our egl_display, not the guest's display parameter: on some
+    // drivers they aren't interchangeable and the guest's handle silently
+    // yields -1x-1.
     static auto real_query_surface = (EGLBoolean (*)(EGLDisplay, EGLSurface, EGLint, EGLint*))
         getProc("eglQuerySurface");
     if (real_query_surface)
     {
         EGLint w = -1, h = -1;
-        real_query_surface(display, egl_surface, EGL_WIDTH, &w);
-        real_query_surface(display, egl_surface, EGL_HEIGHT, &h);
+        real_query_surface(egl_display, egl_surface, EGL_WIDTH, &w);
+        real_query_surface(egl_display, egl_surface, EGL_HEIGHT, &h);
         printf("[egl] eglCreateWindowSurface: real driver surface size %dx%d\n", w, h);
     }
     return egl_surface;
@@ -646,7 +687,11 @@ EGLBoolean egl_bind_thread_context()
     static auto real_make_current = (EGLBoolean (*)(EGLDisplay, EGLSurface, EGLSurface, EGLContext))
         getProc("eglMakeCurrent");
     if (!real_make_current || !egl_display || !egl_context)
+    {
+        printf("[egl_bind] failed: missing eglMakeCurrent=%p egl_display=%p egl_context=%p\n",
+            (void *)real_make_current, egl_display, egl_context);
         return EGL_FALSE;
+    }
 
     // first thread in takes the context the loader already made
     if (real_make_current(egl_display, egl_surface, egl_surface, egl_context))
@@ -656,16 +701,23 @@ EGLBoolean egl_bind_thread_context()
     EGLint configID = 0;
     if (!((EGLBoolean (*)(EGLDisplay, EGLContext, EGLint, EGLint *))getProc("eglQueryContext"))(
             egl_display, egl_context, EGL_CONFIG_ID, &configID))
+    {
+        printf("[egl_bind] failed: eglQueryContext(EGL_CONFIG_ID) on the main context\n");
         return EGL_FALSE;
+    }
 
     EGLint total = 0;
     auto get_configs = (EGLBoolean (*)(EGLDisplay, EGLConfig *, EGLint, EGLint *))getProc("eglGetConfigs");
     if (!get_configs || !get_configs(egl_display, NULL, 0, &total) || total <= 0)
+    {
+        printf("[egl_bind] failed: eglGetConfigs returned %d configs\n", total);
         return EGL_FALSE;
+    }
 
     EGLConfig *all = (EGLConfig *)malloc(total * sizeof(EGLConfig));
     if (!all || !get_configs(egl_display, all, total, &total))
     {
+        printf("[egl_bind] failed: could not enumerate %d configs (all=%p)\n", total, (void *)all);
         free(all);
         return EGL_FALSE;
     }
@@ -683,16 +735,35 @@ EGLBoolean egl_bind_thread_context()
     }
     free(all);
     if (!match)
+    {
+        printf("[egl_bind] failed: none of the %d configs matched the main context's config ID %d\n",
+            total, configID);
         return EGL_FALSE;
+    }
 
     const EGLint attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
     EGLContext shared = ((EGLContext (*)(EGLDisplay, EGLConfig, EGLContext, const EGLint *))
         getProc("eglCreateContext"))(egl_display, match, egl_context, attribs);
     if (!shared)
+    {
+        printf("[egl_bind] failed: eglCreateContext (shared with the main context) returned NULL\n");
         return EGL_FALSE;
+    }
 
-    if (!real_make_current(egl_display, egl_surface, egl_surface, shared))
+    // This thread only needs a valid current context so its GL calls (texture
+    // uploads, offscreen clears) don't crash -- the on-screen draw happens on
+    // whichever thread the engine bound to egl_surface. Bind surfaceless
+    // (EGL_KHR_surfaceless_context) so we don't contend for a surface that can
+    // only be current in one context at a time: Mali rejects a second
+    // concurrent bind to the same surface outright, where other drivers let it
+    // slide. Fall back to the real surface only if surfaceless is refused.
+    if (!real_make_current(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, shared) &&
+        !real_make_current(egl_display, egl_surface, egl_surface, shared))
+    {
+        printf("[egl_bind] failed: eglMakeCurrent with the new shared context %p "
+               "(tried both surfaceless and the real surface)\n", shared);
         return EGL_FALSE;
+    }
 
     printf("[NATIVE] gave this thread its own context %p (shared with %p)\n", shared, egl_context);
     fflush(stdout);
@@ -726,7 +797,22 @@ EGLBoolean eglMakeCurrent_impl(EGLDisplay display,
         draw = EGL_NO_SURFACE;
     if (read == FAKE_PBUFFER_SURFACE)
         read = EGL_NO_SURFACE;
-    return cached_eglMakeCurrent(display, draw, read, context);
+    EGLBoolean ok = cached_eglMakeCurrent(display, draw, read, context);
+    // Report failures (first few only): a context that never binds means a
+    // black screen with no other symptom, and eglGetError_impl below always
+    // claims EGL_SUCCESS, so the guest never sees this either. The real error
+    // code says which EGL rule was broken -- 0x300d (EGL_BAD_SURFACE) and
+    // "surface already current on another thread" are the usual culprits.
+    static int logged = 0;
+    if (!ok && logged < 20)
+    {
+        logged++;
+        EGLint err = ((EGLint (*)())getProc("eglGetError"))();
+        printf("[eglMakeCurrent] FAILED: thread=%lu display=%p draw=%p read=%p context=%p "
+               "eglGetError=0x%x\n",
+            (unsigned long)SDL_ThreadID(), display, draw, read, context, err);
+    }
+    return ok;
 }
 
 EGLint eglGetError_impl()

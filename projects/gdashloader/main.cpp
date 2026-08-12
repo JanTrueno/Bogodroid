@@ -24,6 +24,7 @@
  */
 
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -76,7 +77,7 @@ EGLBoolean eglSwapBuffers_impl(EGLDisplay display, EGLSurface surface);
 so_module fmod_mod; // libfmod.so       (loaded first: exports feed the game)
 so_module game_mod; // libcocos2dcpp.so
 
-static volatile int g_quit = 0;
+static volatile sig_atomic_t g_quit = 0;
 volatile int gdash_block_back_button = 0;
 
 // The JNI env handed to the game (a LocalFrame's env, alive for the whole
@@ -470,10 +471,16 @@ static void build_virtual_pointers(void)
 {
     const float w = (float)screen_width, h = (float)screen_height;
 
+    // A is the menu click or the jump tap, never both -- raising VPTR_JUMP
+    // during a click would also tap the bottom-right corner, pressing
+    // whatever button sits there no matter where the cursor is.
+    const int cursor_on = cursor_visible();
+
     int jump = 0, left = 0, right = 0;
     if (ctr)
     {
-        jump |= SDL_GameControllerGetButton(ctr, SDL_CONTROLLER_BUTTON_A);
+        if (!cursor_on)
+            jump |= SDL_GameControllerGetButton(ctr, SDL_CONTROLLER_BUTTON_A);
         left |= SDL_GameControllerGetButton(ctr, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
         right |= SDL_GameControllerGetButton(ctr, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
     }
@@ -513,7 +520,7 @@ static void build_virtual_pointers(void)
     // cursor click on A -- but only while the cursor is on screen (i.e. a
     // stick was moved recently, meaning we're navigating a menu). In gameplay
     // the stick is idle, the cursor is hidden, and A is purely the jump tap.
-    if (ctr && SDL_GameControllerGetButton(ctr, SDL_CONTROLLER_BUTTON_A) && cursor_visible())
+    if (ctr && SDL_GameControllerGetButton(ctr, SDL_CONTROLLER_BUTTON_A) && cursor_on)
     {
         pnew[VPTR_CURSOR].active = 1;
         pnew[VPTR_CURSOR].x = cursor_x;
@@ -640,15 +647,77 @@ static void back_press(void)
 static int s_app_focused = 1;
 
 // GD only saves on background/quit, which is unreliable; call its own
-// quick-save directly.
+// quick-save directly. This serializes, compresses and writes the whole
+// GameManager (a couple of MB once online songs/levels are in it) on the
+// calling thread -- ~400 ms, so it must only ever run somewhere a dropped
+// frame does not matter. Never call it from the render loop mid-level.
 static void force_save(void)
 {
-    if (gd.gmSharedState && gd.gmDoQuickSave)
+    if (!gd.gmSharedState || !gd.gmDoQuickSave)
+        return;
+    void *gm = gd.gmSharedState();
+    if (!gm)
+        return;
+    const double t0 = now_seconds();
+    gd.gmDoQuickSave(gm);
+    const double ms = (now_seconds() - t0) * 1000.0;
+    if (ms > 50.0)
+        printf("[gdash] save took %.0f ms\n", ms);
+}
+
+// ---------------------------------------------------------------------------
+// Save point.
+//
+// GD itself only quick-saves from one place (EndLevelLayer::onMenu -- finishing
+// a level and tapping Menu); on Android everything else rides on the activity
+// lifecycle, which does not exist here. A timer cannot help landing its ~400 ms
+// hitch in the middle of a run, so save on the one moment the player has just
+// stopped playing: leaving a level. Pausing does not need its own save --
+// quitting from the pause menu tears the PlayLayer down and lands here anyway,
+// and resuming changes nothing worth persisting.
+//
+// onExit is virtual, so patch the vtable slot rather than using hook_address():
+// hook_address() overwrites the function's entry with a branch, leaving no way
+// to call the original. Swapping a vtable entry leaves the real function
+// untouched, so the hook can run it first and then save.
+static void (*orig_playlayer_onexit)(void *) = NULL;
+
+static void playlayer_onexit_hook(void *self)
+{
+    orig_playlayer_onexit(self);
+    force_save(); // left a level (quit or finished)
+}
+
+// Find the slot holding fn_sym in vtable_sym and point it at replacement.
+// Matching on the resolved function address rather than a hardcoded index
+// keeps this working if the layout shifts between GD builds; a miss is
+// reported and simply leaves that save point inactive.
+static void hook_vtable_slot(so_module *mod, const char *vtable_sym, const char *fn_sym,
+                             void *replacement, void **out_orig)
+{
+    uintptr_t vtable = so_symbol(mod, vtable_sym);
+    uintptr_t fn = so_symbol(mod, fn_sym);
+    if (!vtable || !fn)
     {
-        void *gm = gd.gmSharedState();
-        if (gm)
-            gd.gmDoQuickSave(gm);
+        printf("[gdash] save point: %s / %s not found -- skipping\n", vtable_sym, fn_sym);
+        return;
     }
+    uintptr_t *slots = (uintptr_t *)vtable;
+    for (int i = 0; i < 512; i++)
+    {
+        if (slots[i] != fn)
+            continue;
+        *out_orig = (void *)fn;
+        slots[i] = (uintptr_t)replacement;
+        return;
+    }
+    printf("[gdash] save point: %s not present in %s -- skipping\n", fn_sym, vtable_sym);
+}
+
+static void install_save_points(so_module *mod)
+{
+    hook_vtable_slot(mod, "_ZTV9PlayLayer", "_ZN9PlayLayer6onExitEv",
+        (void *)&playlayer_onexit_hook, (void **)&orig_playlayer_onexit);
 }
 
 static void handle_event(const SDL_Event *e)
@@ -778,6 +847,25 @@ int main(int argc, char *argv[])
     print_backtrace_on_segfault(); // Registers a signal handler to print backtrace on segfaults
     exit_on_signals();             // Exits when CTRL-C is pressed (or SIGINT or SIGTERM is received)
 
+    // ...then take SIGINT/SIGTERM back off it. The shared handler _exit(0)s on
+    // the spot, which skips the quick-save at the end of main() -- and SIGTERM
+    // is exactly how the frontend stops the game, so that is the normal way to
+    // quit, not an edge case. Ask the render loop to finish instead so the
+    // save runs. A second signal still hard-exits, keeping the escape hatch
+    // for a wedged process that the shared handler exists to provide.
+    {
+        struct sigaction sa;
+        sa.sa_handler = [](int) {
+            if (g_quit)
+                _exit(0);
+            g_quit = 1;
+        };
+        sa.sa_flags = 0;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
+
     if (argc < 2)
     {
         fatal_error("Usage: %s <config file>\n", argv[0]);
@@ -847,6 +935,13 @@ int main(int argc, char *argv[])
             hook_address(&game_mod, purge, (uintptr_t)&noop_void);
     }
 
+    // Server compat (TLS verification/CA bundle, online-level metadata parser
+    // crash, fresh-profile leaderboard bootstrap) -- see imports.cpp.
+    gdash_server_compat_init(&game_mod);
+
+    // Save on leaving a level (see force_save above).
+    install_save_points(&game_mod);
+
     so_flush_caches(&game_mod, 1);
     so_initialize(&game_mod);
 
@@ -893,6 +988,7 @@ int main(int argc, char *argv[])
     gd.init(g_env, NULL, screen_width, screen_height);
 
     unsigned frame_count = 0;
+    double frame_prev = now_seconds();
     while (!g_quit)
     {
         SDL_Event e;
@@ -903,11 +999,17 @@ int main(int argc, char *argv[])
         gd.render(g_env, NULL);
         cursor_render();
         eglSwapBuffers_impl(egl_display, egl_surface);
-        if (++frame_count >= 60 * 20)
-        { // ~20 s autosave
-            frame_count = 0;
-            force_save();
-        }
+
+        // Hitch reporter: at 60 fps a frame is ~16.7 ms, so anything past
+        // 100 ms is a visible stutter. Only outliers are printed, and the
+        // save points are all outside gameplay, so this should stay silent
+        // mid-level -- if it does not, something else is stalling the loop.
+        const double frame_now = now_seconds();
+        const double frame_ms = (frame_now - frame_prev) * 1000.0;
+        frame_prev = frame_now;
+        if (frame_ms > 100.0 && frame_count > 60)
+            printf("[gdash] frame hitch: %.0f ms\n", frame_ms);
+        frame_count++;
     }
 
     if (s_app_focused)
